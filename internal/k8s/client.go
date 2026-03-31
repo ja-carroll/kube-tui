@@ -3,23 +3,39 @@ package k8s
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"path/filepath"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/homedir"
+	metricsv "k8s.io/metrics/pkg/client/clientset/versioned"
+	"sigs.k8s.io/yaml"
 )
 
-// Client wraps the Kubernetes clientset.
-// In Go, it's common to create a thin wrapper like this rather than exposing
-// the raw third-party type. This gives us a single place to add helper methods
-// and means the rest of our app doesn't need to import client-go directly.
+// ClusterStats holds cluster-wide resource utilization.
+type ClusterStats struct {
+	CPUUsedMillis     int64
+	CPUTotalMillis    int64
+	MemUsedBytes      int64
+	MemTotalBytes     int64
+	NodeCount         int
+	PodCount          int
+	MetricsAvailable  bool
+}
+
+// Client wraps the Kubernetes clientset and optional metrics client.
 type Client struct {
-	clientset *kubernetes.Clientset
+	clientset     *kubernetes.Clientset
+	metricsClient metricsv.Interface // nil if metrics-server is unavailable
+	ContextName   string
+	ClusterName   string
 }
 
 // NewClient creates a connection to Kubernetes using your ~/.kube/config.
@@ -37,23 +53,47 @@ func NewClient() (*Client, error) {
 
 	kubeconfig := filepath.Join(home, ".kube", "config")
 
-	// clientcmd.BuildConfigFromFlags parses the kubeconfig file into a rest.Config.
-	// The first param ("") is the master URL — empty means "read it from the config file".
-	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	// Load the full kubeconfig to extract context/cluster metadata.
+	// clientcmd.NewNonInteractiveDeferredLoadingClientConfig is a mouthful,
+	// but it's the standard way to load kubeconfig with all its context info.
+	// Go libraries sometimes have long names — the convention is clarity over brevity.
+	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig}
+	configOverrides := &clientcmd.ConfigOverrides{}
+	kubeLoader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+
+	// RawConfig gives us the full kubeconfig structure — contexts, clusters, users.
+	rawConfig, err := kubeLoader.RawConfig()
 	if err != nil {
-		// fmt.Errorf with %w "wraps" the original error. This preserves the chain
-		// so callers can use errors.Is() or errors.As() to inspect the root cause.
 		return nil, fmt.Errorf("loading kubeconfig: %w", err)
 	}
 
-	// kubernetes.NewForConfig creates the clientset — a collection of API clients,
-	// one for each Kubernetes resource type (pods, services, deployments, etc.).
+	contextName := rawConfig.CurrentContext
+	clusterName := ""
+	if ctx, ok := rawConfig.Contexts[contextName]; ok {
+		clusterName = ctx.Cluster
+	}
+
+	config, err := clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("loading kubeconfig: %w", err)
+	}
+
 	clientset, err := kubernetes.NewForConfig(config)
 	if err != nil {
 		return nil, fmt.Errorf("creating kubernetes client: %w", err)
 	}
 
-	return &Client{clientset: clientset}, nil
+	// Create metrics client — this is optional. If metrics-server isn't
+	// installed on the cluster, the client will be created successfully
+	// but API calls will fail. We handle that gracefully at call sites.
+	mc, _ := metricsv.NewForConfig(config)
+
+	return &Client{
+		clientset:     clientset,
+		metricsClient: mc,
+		ContextName:   contextName,
+		ClusterName:   clusterName,
+	}, nil
 }
 
 // ListNamespaces returns the names of all namespaces in the cluster.
@@ -83,68 +123,66 @@ func (c *Client) ListNamespaces(ctx context.Context) ([]string, error) {
 	return names, nil
 }
 
-// ListPods returns the names of all pods in a given namespace.
-func (c *Client) ListPods(ctx context.Context, namespace string) ([]string, error) {
-	podList, err := c.clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("listing pods in %s: %w", namespace, err)
+// GetClusterStats returns cluster-wide CPU and memory utilization.
+// If metrics-server is not available, it returns stats with MetricsAvailable=false
+// but still includes node/pod counts from the core API.
+func (c *Client) GetClusterStats(ctx context.Context) ClusterStats {
+	stats := ClusterStats{}
+
+	// Node count + allocatable capacity (always available)
+	nodeList, err := c.clientset.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err == nil {
+		stats.NodeCount = len(nodeList.Items)
+		for _, node := range nodeList.Items {
+			stats.CPUTotalMillis += node.Status.Allocatable.Cpu().MilliValue()
+			stats.MemTotalBytes += node.Status.Allocatable.Memory().Value()
+		}
 	}
 
-	names := make([]string, 0, len(podList.Items))
-	for _, pod := range podList.Items {
-		names = append(names, pod.Name)
+	// Pod count (always available)
+	podList, err := c.clientset.CoreV1().Pods("").List(ctx, metav1.ListOptions{})
+	if err == nil {
+		stats.PodCount = len(podList.Items)
 	}
 
-	return names, nil
+	// Node metrics (requires metrics-server)
+	if c.metricsClient != nil {
+		nodeMetrics, err := c.metricsClient.MetricsV1beta1().NodeMetricses().List(ctx, metav1.ListOptions{})
+		if err == nil && len(nodeMetrics.Items) > 0 {
+			stats.MetricsAvailable = true
+			for _, nm := range nodeMetrics.Items {
+				stats.CPUUsedMillis += nm.Usage.Cpu().MilliValue()
+				stats.MemUsedBytes += nm.Usage.Memory().Value()
+			}
+		}
+	}
+
+	return stats
 }
 
-// ListDeployments returns the names of all deployments in a given namespace.
-// Deployments live in the "apps/v1" API group — that's why we use AppsV1()
-// instead of CoreV1(). Kubernetes organises resources into API groups to keep
-// things modular. Core resources (pods, services, configmaps, namespaces)
-// predate the group system, so they live in CoreV1 for historical reasons.
-func (c *Client) ListDeployments(ctx context.Context, namespace string) ([]string, error) {
-	depList, err := c.clientset.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+// PodMetricsMap returns a map of pod name → (cpuMillis, memBytes) for a namespace.
+// Returns an empty map if metrics-server is unavailable (graceful degradation).
+func (c *Client) PodMetricsMap(ctx context.Context, namespace string) map[string][2]int64 {
+	result := make(map[string][2]int64)
+	if c.metricsClient == nil {
+		return result
+	}
+
+	podMetrics, err := c.metricsClient.MetricsV1beta1().PodMetricses(namespace).List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return nil, fmt.Errorf("listing deployments in %s: %w", namespace, err)
+		return result
 	}
 
-	names := make([]string, 0, len(depList.Items))
-	for _, dep := range depList.Items {
-		names = append(names, dep.Name)
+	for _, pm := range podMetrics.Items {
+		var cpuTotal, memTotal int64
+		for _, container := range pm.Containers {
+			cpuTotal += container.Usage.Cpu().MilliValue()
+			memTotal += container.Usage.Memory().Value()
+		}
+		result[pm.Name] = [2]int64{cpuTotal, memTotal}
 	}
 
-	return names, nil
-}
-
-// ListServices returns the names of all services in a given namespace.
-func (c *Client) ListServices(ctx context.Context, namespace string) ([]string, error) {
-	svcList, err := c.clientset.CoreV1().Services(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("listing services in %s: %w", namespace, err)
-	}
-
-	names := make([]string, 0, len(svcList.Items))
-	for _, svc := range svcList.Items {
-		names = append(names, svc.Name)
-	}
-
-	return names, nil
-}
-
-// ListConfigMaps returns the names of all configmaps in a given namespace.
-func (c *Client) ListConfigMaps(ctx context.Context, namespace string) ([]string, error) {
-	cmList, err := c.clientset.CoreV1().ConfigMaps(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("listing configmaps in %s: %w", namespace, err)
-	}
-
-	names := make([]string, 0, len(cmList.Items))
-	for _, cm := range cmList.Items {
-		names = append(names, cm.Name)
-	}
-
-	return names, nil
+	return result
 }
 
 // StreamPodLogs streams log lines from a pod into a channel.
@@ -250,4 +288,286 @@ func (c *Client) GetPodLogs(ctx context.Context, namespace, podName string) (str
 	}
 
 	return string(bytes), nil
+}
+
+// GetResourceYAML fetches a resource as YAML text. We use the typed API to get
+// the resource as JSON, convert it to a map, clean out the noisy server-managed
+// fields (managedFields, resourceVersion, uid, etc.), then convert to YAML.
+//
+// Why JSON→map→YAML instead of just getting YAML directly? The Kubernetes
+// client-go library speaks JSON natively. There's no built-in YAML endpoint.
+// The "sigs.k8s.io/yaml" package bridges the two — it's the standard way to
+// do JSON↔YAML conversion in the Kubernetes ecosystem.
+func (c *Client) GetResourceYAML(ctx context.Context, resType, namespace, name string) (string, error) {
+	var raw []byte
+	var err error
+
+	// Each resource type uses a different API group. This switch is similar
+	// to our fetchResources — we dispatch to the right API based on type.
+	switch resType {
+	case "Pods":
+		obj, e := c.clientset.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	case "Deployments":
+		obj, e := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	case "StatefulSets":
+		obj, e := c.clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	case "DaemonSets":
+		obj, e := c.clientset.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	case "Services":
+		obj, e := c.clientset.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	case "ConfigMaps":
+		obj, e := c.clientset.CoreV1().ConfigMaps(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	case "Secrets":
+		obj, e := c.clientset.CoreV1().Secrets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	case "Jobs":
+		obj, e := c.clientset.BatchV1().Jobs(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	case "CronJobs":
+		obj, e := c.clientset.BatchV1().CronJobs(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	case "Ingresses":
+		obj, e := c.clientset.NetworkingV1().Ingresses(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	case "PVCs":
+		obj, e := c.clientset.CoreV1().PersistentVolumeClaims(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
+	default:
+		return "", fmt.Errorf("unsupported resource type: %s", resType)
+	}
+
+	if err != nil {
+		return "", fmt.Errorf("getting %s/%s: %w", resType, name, err)
+	}
+
+	// Convert JSON to a map so we can clean up noisy server-managed fields.
+	// These fields clutter the YAML and aren't useful for editing.
+	var obj map[string]interface{}
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return "", fmt.Errorf("parsing resource: %w", err)
+	}
+	if meta, ok := obj["metadata"].(map[string]interface{}); ok {
+		delete(meta, "managedFields")
+		delete(meta, "uid")
+		delete(meta, "creationTimestamp")
+		delete(meta, "generation")
+		delete(meta, "resourceVersion")
+	}
+	delete(obj, "status")
+
+	// yaml.Marshal from sigs.k8s.io/yaml produces Kubernetes-style YAML.
+	yamlBytes, err := yaml.Marshal(obj)
+	if err != nil {
+		return "", fmt.Errorf("converting to YAML: %w", err)
+	}
+	return string(yamlBytes), nil
+}
+
+// ApplyYAML takes a YAML string and applies it to the cluster.
+// It converts YAML→JSON and uses the strategic merge patch to update
+// the resource. This is similar to `kubectl apply` — it merges your
+// changes with the existing resource rather than replacing it entirely.
+//
+// types.StrategicMergePatchType is the "smart" patch type for Kubernetes.
+// Unlike a plain merge, it understands Kubernetes-specific merge semantics
+// (e.g., it knows how to merge container lists in a pod spec by name
+// rather than by array index).
+func (c *Client) ApplyYAML(ctx context.Context, resType, namespace, name string, yamlData []byte) error {
+	// Convert YAML to JSON — the Kubernetes API speaks JSON.
+	jsonData, err := yaml.YAMLToJSON(yamlData)
+	if err != nil {
+		return fmt.Errorf("converting YAML to JSON: %w", err)
+	}
+
+	patchType := types.StrategicMergePatchType
+
+	switch resType {
+	case "Pods":
+		_, err = c.clientset.CoreV1().Pods(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	case "Deployments":
+		_, err = c.clientset.AppsV1().Deployments(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	case "StatefulSets":
+		_, err = c.clientset.AppsV1().StatefulSets(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	case "DaemonSets":
+		_, err = c.clientset.AppsV1().DaemonSets(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	case "Services":
+		_, err = c.clientset.CoreV1().Services(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	case "ConfigMaps":
+		_, err = c.clientset.CoreV1().ConfigMaps(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	case "Secrets":
+		_, err = c.clientset.CoreV1().Secrets(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	case "Jobs":
+		_, err = c.clientset.BatchV1().Jobs(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	case "CronJobs":
+		_, err = c.clientset.BatchV1().CronJobs(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	case "Ingresses":
+		_, err = c.clientset.NetworkingV1().Ingresses(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	case "PVCs":
+		_, err = c.clientset.CoreV1().PersistentVolumeClaims(namespace).Patch(ctx, name, patchType, jsonData, metav1.PatchOptions{})
+	default:
+		return fmt.Errorf("unsupported resource type: %s", resType)
+	}
+
+	return err
+}
+
+// DeleteResource deletes a resource by type, namespace, and name.
+func (c *Client) DeleteResource(ctx context.Context, resType, namespace, name string) error {
+	var err error
+	switch resType {
+	case "Pods":
+		err = c.clientset.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case "Deployments":
+		err = c.clientset.AppsV1().Deployments(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case "StatefulSets":
+		err = c.clientset.AppsV1().StatefulSets(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case "DaemonSets":
+		err = c.clientset.AppsV1().DaemonSets(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case "Services":
+		err = c.clientset.CoreV1().Services(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case "ConfigMaps":
+		err = c.clientset.CoreV1().ConfigMaps(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case "Secrets":
+		err = c.clientset.CoreV1().Secrets(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case "Jobs":
+		err = c.clientset.BatchV1().Jobs(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case "CronJobs":
+		err = c.clientset.BatchV1().CronJobs(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case "Ingresses":
+		err = c.clientset.NetworkingV1().Ingresses(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	case "PVCs":
+		err = c.clientset.CoreV1().PersistentVolumeClaims(namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	default:
+		return fmt.Errorf("unsupported resource type: %s", resType)
+	}
+	return err
+}
+
+// RolloutRestart triggers a rollout restart for Deployments, StatefulSets, or
+// DaemonSets. This works exactly like `kubectl rollout restart` — it patches
+// the pod template annotation with the current timestamp, which changes the
+// pod spec and triggers a rolling update. No pods are directly deleted;
+// the controller handles the gradual replacement.
+func (c *Client) RolloutRestart(ctx context.Context, resType, namespace, name string) error {
+	// The patch sets a restart annotation on the pod template. The controller
+	// sees the template changed and starts a rolling update.
+	patch := fmt.Sprintf(
+		`{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"%s"}}}}}`,
+		time.Now().Format(time.RFC3339),
+	)
+	patchBytes := []byte(patch)
+	patchType := types.StrategicMergePatchType
+
+	var err error
+	switch resType {
+	case "Deployments":
+		_, err = c.clientset.AppsV1().Deployments(namespace).Patch(ctx, name, patchType, patchBytes, metav1.PatchOptions{})
+	case "StatefulSets":
+		_, err = c.clientset.AppsV1().StatefulSets(namespace).Patch(ctx, name, patchType, patchBytes, metav1.PatchOptions{})
+	case "DaemonSets":
+		_, err = c.clientset.AppsV1().DaemonSets(namespace).Patch(ctx, name, patchType, patchBytes, metav1.PatchOptions{})
+	default:
+		return fmt.Errorf("rollout restart not supported for %s", resType)
+	}
+	return err
+}
+
+// GetReplicas returns the current replica count for a scalable resource.
+func (c *Client) GetReplicas(ctx context.Context, resType, namespace, name string) (int, error) {
+	switch resType {
+	case "Deployments":
+		obj, err := c.clientset.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return 0, err
+		}
+		if obj.Spec.Replicas != nil {
+			return int(*obj.Spec.Replicas), nil
+		}
+		return 1, nil // default is 1 if unset
+	case "StatefulSets":
+		obj, err := c.clientset.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return 0, err
+		}
+		if obj.Spec.Replicas != nil {
+			return int(*obj.Spec.Replicas), nil
+		}
+		return 1, nil
+	default:
+		return 0, fmt.Errorf("scale not supported for %s", resType)
+	}
+}
+
+// ScaleResource sets the replica count for a Deployment or StatefulSet.
+func (c *Client) ScaleResource(ctx context.Context, resType, namespace, name string, replicas int) error {
+	scale, err := c.clientset.AppsV1().Deployments(namespace).GetScale(ctx, name, metav1.GetOptions{})
+	if resType == "StatefulSets" {
+		scale, err = c.clientset.AppsV1().StatefulSets(namespace).GetScale(ctx, name, metav1.GetOptions{})
+	}
+	if err != nil {
+		return fmt.Errorf("getting current scale: %w", err)
+	}
+
+	replicas32 := int32(replicas)
+	scale.Spec.Replicas = replicas32
+
+	switch resType {
+	case "Deployments":
+		_, err = c.clientset.AppsV1().Deployments(namespace).UpdateScale(ctx, name, scale, metav1.UpdateOptions{})
+	case "StatefulSets":
+		_, err = c.clientset.AppsV1().StatefulSets(namespace).UpdateScale(ctx, name, scale, metav1.UpdateOptions{})
+	default:
+		return fmt.Errorf("scale not supported for %s", resType)
+	}
+	return err
 }

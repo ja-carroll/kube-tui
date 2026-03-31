@@ -8,7 +8,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
+	lipgloss "charm.land/lipgloss/v2"
 	"github.com/ja-carroll/kube-tui/internal/k8s"
 )
 
@@ -190,7 +190,11 @@ func (lv logViewer) handleSaveInput(msg tea.KeyMsg) logViewer {
 }
 
 func (lv logViewer) viewableHeight() int {
-	h := lv.height - 5
+	// Total height budget: terminal height
+	// - 4 for box overhead (border + padding)
+	// - 2 for help bar
+	// - 3 for title + scroll info + gaps inside the box
+	h := lv.height - 9
 	if h < 1 {
 		h = 1
 	}
@@ -228,8 +232,11 @@ func (lv logViewer) view() string {
 		totalLines, lv.offset,
 	))
 
+	// Set explicit height to prevent overflow. Content height = terminal - overhead.
+	panelContentHeight := lv.height - 6 // 4 box overhead + 2 help bar
 	panel := activePanelStyle.
 		Width(lv.width - 4).
+		Height(panelContentHeight).
 		Render(lipgloss.JoinVertical(lipgloss.Left, title, content, scrollInfo))
 
 	// Bottom bar: save prompt, status message, or normal help
