@@ -927,18 +927,20 @@ func (m Model) View() string {
 	// running commands against the wrong cluster is a classic footgun.
 	header := m.renderHeader()
 
-	sideWidth := m.width/3 - 2
-	mainWidth := m.width - sideWidth - 6
+	sideWidth := m.width / 3
+	mainWidth := m.width - sideWidth
 
 	// Height budget calculation.
-	// Each box with RoundedBorder + Padding(1,2) adds 4 lines of overhead
-	// (1 top border + 1 top padding + 1 bottom padding + 1 bottom border).
-	// We have: header (1 line) + 2 sidebar boxes (8 overhead) + help bar (2 lines) = 11 lines of chrome.
+	// renderPanel adds 2 lines of overhead per box (top border + bottom border).
+	// We have: header (1) + help bar (1) + 3 panels (6 overhead total for sidebar's 2 + main's 2... but
+	// sidebar has 2 panels stacked = 4 lines of border). Main panel = 2 lines of border.
+	// Total chrome = 1 (header) + 4 (sidebar borders) + 1 (help) = 6
 	headerHeight := 1
-	boxOverhead := 4           // border + padding per box
-	helpBarHeight := 2         // help text + margin
-	resBoxContent := len(allResourceTypes) + 2 // items + title + gap
-	totalChrome := headerHeight + (boxOverhead * 2) + helpBarHeight
+	borderOverhead := 2        // top + bottom border per panel
+	helpBarHeight := 1
+	resBoxContent := len(allResourceTypes) // just the items, no title (it's in the border)
+	totalSidebarBorders := borderOverhead * 2 // 2 sidebar panels
+	totalChrome := headerHeight + totalSidebarBorders + helpBarHeight
 	nsBoxHeight := m.height - totalChrome - resBoxContent
 	resBoxHeight := resBoxContent
 	if nsBoxHeight < 3 {
@@ -948,34 +950,32 @@ func (m Model) View() string {
 	nsContent := m.renderNamespaceList()
 	resContent := m.renderResourceList()
 
-	// Style each box — highlight whichever section is active
-	var nsBox, resBox string
-	if m.activePane == leftPane && m.leftSection == namespacesSection {
-		nsBox = activePanelStyle.Width(sideWidth).Height(nsBoxHeight).Render(nsContent)
-	} else {
-		nsBox = panelStyle.Width(sideWidth).Height(nsBoxHeight).Render(nsContent)
+	// Use renderPanel for lazygit-style borders with embedded titles and counters
+	nsActive := m.activePane == leftPane && m.leftSection == namespacesSection
+	resActive := m.activePane == leftPane && m.leftSection == resourcesSection
+
+	nsCursor := m.nsCursor
+	if len(m.filteredNS) == 0 {
+		nsCursor = -1
 	}
-	if m.activePane == leftPane && m.leftSection == resourcesSection {
-		resBox = activePanelStyle.Width(sideWidth).Height(resBoxHeight).Render(resContent)
-	} else {
-		resBox = panelStyle.Width(sideWidth).Height(resBoxHeight).Render(resContent)
-	}
+	nsBox := renderPanel("Namespaces", nsContent, sideWidth, nsBoxHeight+borderOverhead, nsActive, nsCursor, len(m.filteredNS))
+	resBox := renderPanel("Resources", resContent, sideWidth, resBoxHeight+borderOverhead, resActive, m.resCursor, len(allResourceTypes))
 
 	sidebar := lipgloss.JoinVertical(lipgloss.Left, nsBox, resBox)
 
 	// Main panel — its rendered height must match the sidebar's total rendered height.
-	// Sidebar total rendered = (nsBoxHeight + 4) + (resBoxHeight + 4)
-	// Main panel rendered = mainHeight + 4
-	// So: mainHeight = nsBoxHeight + resBoxHeight + 4
-	mainHeight := nsBoxHeight + resBoxHeight + boxOverhead
-	mainContent := m.renderMainPanel(mainWidth)
+	// Sidebar outer = (nsBoxHeight + 2) + (resBoxHeight + 2) = nsBoxHeight + resBoxHeight + 4
+	// Main outer = mainHeight + 2, so mainHeight = nsBoxHeight + resBoxHeight + 2
+	mainHeight := nsBoxHeight + resBoxHeight + borderOverhead
+	mainContent := m.renderMainPanel(mainWidth, mainHeight)
 
-	var mainPanel string
-	if m.activePane == rightPane {
-		mainPanel = activePanelStyle.Width(mainWidth).Height(mainHeight).Render(mainContent)
-	} else {
-		mainPanel = panelStyle.Width(mainWidth).Height(mainHeight).Render(mainContent)
+	mainTitle := fmt.Sprintf("%s (%s)", m.selectedRes, m.selectedNS)
+	mainActive := m.activePane == rightPane
+	mainCursor := m.itemCursor
+	if len(m.filteredItems) == 0 {
+		mainCursor = -1
 	}
+	mainPanel := renderPanel(mainTitle, mainContent, mainWidth, mainHeight+borderOverhead, mainActive, mainCursor, len(m.filteredItems))
 
 	panels := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, mainPanel)
 
@@ -1082,10 +1082,8 @@ func (m Model) renderHeader() string {
 		Render(bar)
 }
 
-// renderNamespaceList builds the content for the namespace box.
+// renderNamespaceList builds the content for the namespace box (no title — it goes in the border).
 func (m Model) renderNamespaceList() string {
-	title := titleStyle.Render("Namespaces")
-
 	var items []string
 	for i, ns := range m.filteredNS {
 		isCursorHere := m.activePane == leftPane && m.leftSection == namespacesSection && m.nsCursor == i
@@ -1102,13 +1100,11 @@ func (m Model) renderNamespaceList() string {
 		items = append(items, line)
 	}
 
-	return title + "\n" + strings.Join(items, "\n")
+	return strings.Join(items, "\n")
 }
 
-// renderResourceList builds the content for the resource type box.
+// renderResourceList builds the content for the resource type box (no title — it goes in the border).
 func (m Model) renderResourceList() string {
-	title := titleStyle.Render("Resources")
-
 	var items []string
 	for i, rt := range allResourceTypes {
 		isCursorHere := m.activePane == leftPane && m.leftSection == resourcesSection && m.resCursor == i
@@ -1125,23 +1121,21 @@ func (m Model) renderResourceList() string {
 		items = append(items, line)
 	}
 
-	return title + "\n" + strings.Join(items, "\n")
+	return strings.Join(items, "\n")
 }
 
-// renderMainPanel builds the right pane with a table list on top
-// and details for the selected item on the bottom.
-func (m Model) renderMainPanel(width int) string {
-	title := titleStyle.Render(fmt.Sprintf("%s (%s)", m.selectedRes, m.selectedNS))
-
+// renderMainPanel builds the right pane content — table on top, details
+// pushed to the bottom. No title here; it goes in the border.
+func (m Model) renderMainPanel(width, height int) string {
 	if m.items == nil {
-		return title + "\n" + dimmedItemStyle.Render("Loading...")
+		return dimmedItemStyle.Render("Loading...")
 	}
 	if len(m.filteredItems) == 0 {
 		noResult := "No " + strings.ToLower(m.selectedRes.String()) + " found"
 		if m.searchQuery != "" {
 			noResult += fmt.Sprintf(" matching \"%s\"", m.searchQuery)
 		}
-		return title + "\n" + dimmedItemStyle.Render(noResult)
+		return dimmedItemStyle.Render(noResult)
 	}
 
 	// Build table with columns.
@@ -1204,8 +1198,8 @@ func (m Model) renderMainPanel(width int) string {
 
 	table := headerLine + "\n" + strings.Join(rows, "\n")
 
-	// Detail panel below the table
-	detailSep := dimmedItemStyle.Render(strings.Repeat("─", width-2))
+	// Detail panel — pushed to the bottom of the panel.
+	detailSep := dimmedItemStyle.Render(strings.Repeat("─", width-4))
 
 	selected := m.filteredItems[m.itemCursor]
 	details := selected.Details()
@@ -1218,7 +1212,16 @@ func (m Model) renderMainPanel(width int) string {
 	}
 	detailContent := strings.Join(detailLines, "\n")
 
-	return title + "\n" + table + "\n\n" + detailSep + "\n\n" + detailContent
+	// Calculate how many blank lines we need to push details to the bottom.
+	// height = total inner height available in the panel
+	tableLines := 1 + len(rows) // header + rows
+	detailBlockLines := 1 + 1 + len(detailLines) // separator + gap + detail rows
+	gap := height - tableLines - detailBlockLines - 1
+	if gap < 1 {
+		gap = 1
+	}
+
+	return table + "\n" + strings.Repeat("\n", gap) + detailSep + "\n" + detailContent
 }
 
 // renderSearchBar renders the search input at the bottom of the screen.

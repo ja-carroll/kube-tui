@@ -38,6 +38,81 @@ type Client struct {
 	ClusterName   string
 }
 
+// ContextInfo holds metadata about a kubeconfig context.
+type ContextInfo struct {
+	Name    string
+	Cluster string
+}
+
+// ListContexts reads all available contexts from ~/.kube/config.
+func ListContexts() []ContextInfo {
+	home := homedir.HomeDir()
+	if home == "" {
+		return nil
+	}
+	kubeconfig := filepath.Join(home, ".kube", "config")
+
+	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig}
+	configOverrides := &clientcmd.ConfigOverrides{}
+	kubeLoader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+
+	rawConfig, err := kubeLoader.RawConfig()
+	if err != nil {
+		return nil
+	}
+
+	var contexts []ContextInfo
+	for name, ctx := range rawConfig.Contexts {
+		contexts = append(contexts, ContextInfo{
+			Name:    name,
+			Cluster: ctx.Cluster,
+		})
+	}
+	return contexts
+}
+
+// NewClientForContext creates a connection using a specific kubeconfig context.
+func NewClientForContext(contextName string) (*Client, error) {
+	home := homedir.HomeDir()
+	if home == "" {
+		return nil, fmt.Errorf("could not find home directory")
+	}
+	kubeconfig := filepath.Join(home, ".kube", "config")
+
+	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig}
+	configOverrides := &clientcmd.ConfigOverrides{CurrentContext: contextName}
+	kubeLoader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+
+	rawConfig, err := kubeLoader.RawConfig()
+	if err != nil {
+		return nil, fmt.Errorf("loading kubeconfig: %w", err)
+	}
+
+	clusterName := ""
+	if ctx, ok := rawConfig.Contexts[contextName]; ok {
+		clusterName = ctx.Cluster
+	}
+
+	config, err := kubeLoader.ClientConfig()
+	if err != nil {
+		return nil, fmt.Errorf("building config for context %s: %w", contextName, err)
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf("creating kubernetes client: %w", err)
+	}
+
+	mc, _ := metricsv.NewForConfig(config)
+
+	return &Client{
+		clientset:     clientset,
+		metricsClient: mc,
+		ContextName:   contextName,
+		ClusterName:   clusterName,
+	}, nil
+}
+
 // NewClient creates a connection to Kubernetes using your ~/.kube/config.
 //
 // This function returns (*Client, error) — the "multi-return" pattern is
