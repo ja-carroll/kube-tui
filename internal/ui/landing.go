@@ -3,9 +3,9 @@ package ui
 import (
 	"fmt"
 
-	"github.com/charmbracelet/bubbles/list"
-	"github.com/charmbracelet/bubbles/spinner"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/list"
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/ja-carroll/kube-tui/internal/k8s"
 )
@@ -124,7 +124,7 @@ func (m LandingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.list.SetSize(listWidth, listHeight)
 		return m, nil
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		switch msg.String() {
 		case "ctrl+c", "q":
 			if m.state != stateConnecting {
@@ -174,7 +174,7 @@ func (m LandingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m LandingModel) View() string {
+func (m LandingModel) View() tea.View {
 	renderedLogo := logoStyle.Render(logo)
 	subtitle := subtitleStyle.Render("Kubernetes Terminal User Interface")
 
@@ -203,11 +203,11 @@ func (m LandingModel) View() string {
 		content,
 	)
 
-	return lipgloss.Place(
+	return altView(lipgloss.Place(
 		m.width, m.height,
 		lipgloss.Center, lipgloss.Center,
 		page,
-	)
+	))
 }
 
 // connectToCluster creates a k8s client for the selected context.

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/ja-carroll/kube-tui/internal/k8s"
 )
@@ -490,7 +490,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, tea.Batch(m.refreshResources(), m.fetchClusterStats(), m.tickCmd())
 
-	case tea.KeyMsg:
+	case tea.KeyPressMsg:
 		// Overlay delegation — whichever overlay is active "owns" the input.
 		// This is a state machine pattern: check overlays in priority order,
 		// delegate, and return early. The main key handler only runs when
@@ -515,7 +515,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	// Clear any status message on the next keypress
 	m.statusMsg = ""
 
@@ -571,7 +571,7 @@ func (m Model) handleKeyPress(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // This is a clean separation — search mode has its own key handling so
 // regular keys (like 'j', 'k', 'q') type into the search instead of
 // triggering navigation or quit.
-func (m Model) handleSearchInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) handleSearchInput(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		// Close search and clear the filter
@@ -686,7 +686,7 @@ func (m Model) handleEnter() (tea.Model, tea.Cmd) {
 // doesn't know anything about pods, logs, or deletion. It just reports back
 // "the user picked 'l'" and the parent decides what that means.
 // This separation of concerns keeps the action menu reusable.
-func (m Model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) handleActionMenu(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	menu, closed, selectedKey := m.actionMenu.update(msg)
 	m.actionMenu = menu
 
@@ -770,7 +770,7 @@ func (m Model) handleActionMenu(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 // handleScaleDialog delegates keypresses to the scale input overlay.
-func (m Model) handleScaleDialog(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) handleScaleDialog(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	sd, closed, replicas, cmd := m.scaleDialog.update(msg)
 	m.scaleDialog = sd
 
@@ -909,17 +909,24 @@ func (m Model) restartResource() tea.Cmd {
 }
 
 // View renders the entire UI.
-func (m Model) View() string {
+// altView creates a tea.View with AltScreen enabled.
+func altView(s string) tea.View {
+	v := tea.NewView(s)
+	v.AltScreen = true
+	return v
+}
+
+func (m Model) View() tea.View {
 	if m.err != nil {
-		return fmt.Sprintf("Error: %v\n\nPress q to quit.\n", m.err)
+		return altView(fmt.Sprintf("Error: %v\n\nPress q to quit.\n", m.err))
 	}
 
 	if m.viewingLogs {
-		return m.logViewer.view()
+		return altView(m.logViewer.view())
 	}
 
 	if m.namespaces == nil {
-		return "Loading namespaces...\n"
+		return altView("Loading namespaces...\n")
 	}
 
 	// Render the header bar — shows the cluster context so you always know
@@ -1027,7 +1034,7 @@ func (m Model) View() string {
 		bg := lipgloss.NewLayer(screen)
 		fg := lipgloss.NewLayer(menuBox).X(menuX).Y(menuY).Z(1)
 
-		return lipgloss.NewCompositor(bg, fg).Render()
+		return altView(lipgloss.NewCompositor(bg, fg).Render())
 	}
 
 	// Scale dialog overlay — same compositor pattern
@@ -1040,10 +1047,10 @@ func (m Model) View() string {
 
 		bg := lipgloss.NewLayer(screen)
 		fg := lipgloss.NewLayer(dialogBox).X(dx).Y(dy).Z(1)
-		return lipgloss.NewCompositor(bg, fg).Render()
+		return altView(lipgloss.NewCompositor(bg, fg).Render())
 	}
 
-	return screen
+	return altView(screen)
 }
 
 // renderHeader builds the top bar showing cluster context.

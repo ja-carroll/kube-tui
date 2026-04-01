@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	"github.com/ja-carroll/kube-tui/internal/ui"
 )
 
@@ -14,7 +14,7 @@ func main() {
 	// context and connects successfully, it exits and passes the client
 	// back via the model's Client field.
 	landing := ui.NewLanding()
-	p := tea.NewProgram(landing, tea.WithAltScreen())
+	p := tea.NewProgram(landing)
 	result, err := p.Run()
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
@@ -32,7 +32,7 @@ func main() {
 	// A second Bubble Tea program gets its own alt screen, so the
 	// transition from landing → main is seamless.
 	model := ui.New(landingModel.Client)
-	p = tea.NewProgram(model, tea.WithAltScreen())
+	p = tea.NewProgram(model)
 	if _, err := p.Run(); err != nil {
 		fmt.Printf("Error running program: %v\n", err)
 		os.Exit(1)

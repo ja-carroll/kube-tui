@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	tea "github.com/charmbracelet/bubbletea"
+	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/ja-carroll/kube-tui/internal/k8s"
 )
@@ -101,7 +101,7 @@ func waitForNextLogLine() tea.Cmd {
 	}
 }
 
-func (lv logViewer) update(msg tea.KeyMsg) (logViewer, bool, tea.Cmd) {
+func (lv logViewer) update(msg tea.KeyPressMsg) (logViewer, bool, tea.Cmd) {
 	// If we're in the save prompt, handle filename input
 	if lv.saving {
 		return lv.handleSaveInput(msg), false, nil
@@ -145,7 +145,7 @@ func (lv logViewer) update(msg tea.KeyMsg) (logViewer, bool, tea.Cmd) {
 }
 
 // handleSaveInput processes keystrokes in the filename prompt.
-func (lv logViewer) handleSaveInput(msg tea.KeyMsg) logViewer {
+func (lv logViewer) handleSaveInput(msg tea.KeyPressMsg) logViewer {
 	switch msg.String() {
 	case "esc":
 		// Cancel the save

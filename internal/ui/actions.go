@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
-	tea "github.com/charmbracelet/bubbletea"
+	"charm.land/bubbles/v2/textinput"
+	tea "charm.land/bubbletea/v2"
 	"github.com/ja-carroll/kube-tui/internal/k8s"
 )
 
@@ -93,7 +93,7 @@ func newActionMenu(res k8s.Resource, resType resourceType, namespace string) act
 
 // update handles keypresses in the action menu.
 // Returns: updated menu, whether to close, the selected action key (if any), and a cmd.
-func (am actionMenu) update(msg tea.KeyMsg) (actionMenu, bool, string) {
+func (am actionMenu) update(msg tea.KeyPressMsg) (actionMenu, bool, string) {
 	switch msg.String() {
 	case "esc", "q":
 		return am, true, ""
@@ -178,7 +178,7 @@ func newScaleDialog(resName, namespace, resType string, currentScale int) (scale
 	ti.Placeholder = "replicas"
 	ti.SetValue(strconv.Itoa(currentScale))
 	ti.CharLimit = 4
-	ti.Width = 10
+	ti.SetWidth(10)
 	ti.Prompt = fmt.Sprintf("%s ", symbolK8s)
 
 	// Validate that input is a non-negative integer. textinput calls this
@@ -211,7 +211,7 @@ func newScaleDialog(resName, namespace, resType string, currentScale int) (scale
 
 // update handles keypresses. Returns the updated dialog, whether it closed,
 // the new replica count (or -1 if cancelled), and a tea.Cmd.
-func (sd scaleDialog) update(msg tea.KeyMsg) (scaleDialog, bool, int, tea.Cmd) {
+func (sd scaleDialog) update(msg tea.KeyPressMsg) (scaleDialog, bool, int, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
 		return sd, true, -1, nil
