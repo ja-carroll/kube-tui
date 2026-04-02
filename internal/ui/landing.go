@@ -2,6 +2,8 @@ package ui
 
 import (
 	"fmt"
+	"path/filepath"
+	"strings"
 
 	"charm.land/bubbles/v2/list"
 	"charm.land/bubbles/v2/spinner"
@@ -19,14 +21,11 @@ const logo = `
  ██║  ██╗╚██████╔╝██████╔╝███████╗      ██║   ╚██████╔╝██║
  ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝      ╚═╝    ╚═════╝ ╚═╝`
 
-// Landing page styles (using lipgloss v2 for our rendered text)
+// Landing page styles
 var (
-	logoStyle = lipgloss.NewStyle().
-			Foreground(headerPurple).
-			Bold(true)
-
 	subtitleStyle = lipgloss.NewStyle().
-			Foreground(subtle)
+			Foreground(subtle).
+			Italic(true)
 
 	connectingMsgStyle = lipgloss.NewStyle().
 				Foreground(cyan).
@@ -36,6 +35,28 @@ var (
 				Foreground(red).
 				Bold(true)
 )
+
+// renderGradientLogo renders the ASCII art logo with a per-line color
+// gradient flowing from purple through pink to cyan, top to bottom.
+func renderGradientLogo() string {
+	lines := strings.Split(logo, "\n")
+	// Filter empty lines (the logo string starts with a newline)
+	var nonEmpty []string
+	for _, l := range lines {
+		if strings.TrimSpace(l) != "" {
+			nonEmpty = append(nonEmpty, l)
+		}
+	}
+
+	gradient := lipgloss.Blend1D(len(nonEmpty), gradientPurple, gradientPink, gradientCyan)
+
+	var rendered []string
+	for i, line := range nonEmpty {
+		s := lipgloss.NewStyle().Foreground(gradient[i]).Bold(true)
+		rendered = append(rendered, s.Render(line))
+	}
+	return strings.Join(rendered, "\n")
+}
 
 // landingState tracks the current phase of the landing page.
 type landingState int
@@ -50,10 +71,13 @@ const (
 type contextItem struct {
 	name    string
 	cluster string
+	file    string // kubeconfig file path
 }
 
-func (i contextItem) Title() string       { return i.name }
-func (i contextItem) Description() string { return fmt.Sprintf("cluster: %s", i.cluster) }
+func (i contextItem) Title() string { return i.name }
+func (i contextItem) Description() string {
+	return fmt.Sprintf("cluster: %s · %s", i.cluster, filepath.Base(i.file))
+}
 func (i contextItem) FilterValue() string { return i.name }
 
 // connectedMsg signals that the k8s client is ready.
@@ -86,21 +110,41 @@ func NewLanding() LandingModel {
 
 	items := make([]list.Item, len(contexts))
 	for i, ctx := range contexts {
-		items[i] = contextItem{name: ctx.Name, cluster: ctx.Cluster}
+		items[i] = contextItem{name: ctx.Name, cluster: ctx.Cluster, file: ctx.File}
 	}
 
-	// The default delegate from bubbles/list renders items with title +
-	// description and a left-border highlight on the selected item.
-	// It looks great out of the box with Charm's default theme.
+	// Style the default delegate with our theme colors.
+	// This is now possible because bubbles v2 uses lipgloss v2 —
+	// same types, no version conflict.
 	delegate := list.NewDefaultDelegate()
+	delegate.Styles.SelectedTitle = delegate.Styles.SelectedTitle.
+		Foreground(special).
+		BorderForeground(highlight)
+	delegate.Styles.SelectedDesc = delegate.Styles.SelectedDesc.
+		Foreground(cyan).
+		BorderForeground(highlight)
+	delegate.Styles.NormalTitle = delegate.Styles.NormalTitle.
+		Foreground(cream)
+	delegate.Styles.NormalDesc = delegate.Styles.NormalDesc.
+		Foreground(subtle)
+
 	l := list.New(items, delegate, 50, 14)
 	l.Title = "Select a context"
 	l.SetShowStatusBar(false)
 	l.SetShowHelp(false)
 	l.DisableQuitKeybindings()
 
+	// Style the list title to match our theme
+	l.Styles.Title = lipgloss.NewStyle().
+		Foreground(highlight).
+		Bold(true).
+		Padding(0, 0, 1, 0)
+
 	// Spinner — the Dot style gives a nice animated braille pattern.
-	s := spinner.New(spinner.WithSpinner(spinner.Dot))
+	s := spinner.New(
+		spinner.WithSpinner(spinner.Dot),
+		spinner.WithStyle(lipgloss.NewStyle().Foreground(magenta)),
+	)
 
 	return LandingModel{
 		state:   stateSelectContext,
@@ -139,7 +183,7 @@ func (m LandingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.state = stateConnecting
 				return m, tea.Batch(
 					m.spinner.Tick,
-					connectToCluster(item.name),
+					connectToCluster(item.name, item.file),
 				)
 			}
 			if m.state == stateError {
@@ -156,7 +200,7 @@ func (m LandingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case connectErrMsg:
 		m.state = stateError
 		m.errMsg = msg.err.Error()
-		return m, nil
+		return m, m.spinner.Tick
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -175,7 +219,8 @@ func (m LandingModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m LandingModel) View() tea.View {
-	renderedLogo := logoStyle.Render(logo)
+	// Gradient logo — each line colored from purple through pink to cyan
+	renderedLogo := renderGradientLogo()
 	subtitle := subtitleStyle.Render("Kubernetes Terminal User Interface")
 
 	var content string
@@ -191,8 +236,8 @@ func (m LandingModel) View() tea.View {
 
 	case stateError:
 		content = landingErrorStyle.Render(
-			fmt.Sprintf("\n  %s Connection failed: %s\n\n  Press [enter] to try again\n", symbolCross, m.errMsg),
-		)
+			fmt.Sprintf("\n  %s Connection failed: %s", symbolCross, m.errMsg),
+		) + "\n\n  " + connectingMsgStyle.Render(m.spinner.View()+" Press [enter] to try again") + "\n"
 	}
 
 	// Stack vertically: logo, subtitle, content — then center on screen
@@ -210,10 +255,11 @@ func (m LandingModel) View() tea.View {
 	))
 }
 
-// connectToCluster creates a k8s client for the selected context.
-func connectToCluster(contextName string) tea.Cmd {
+// connectToCluster creates a k8s client for the selected context using
+// the kubeconfig file that context was discovered in.
+func connectToCluster(contextName, kubeconfigPath string) tea.Cmd {
 	return func() tea.Msg {
-		client, err := k8s.NewClientForContext(contextName)
+		client, err := k8s.NewClientForContext(contextName, kubeconfigPath)
 		if err != nil {
 			return connectErrMsg{err: err}
 		}

@@ -2,12 +2,13 @@ package ui
 
 import (
 	"fmt"
+	"image/color"
 	"strings"
 
 	lipgloss "charm.land/lipgloss/v2"
 )
 
-// Color palette — a richer set for visual hierarchy.
+// Color palette — rich gradient-friendly spectrum for a modern TUI.
 var (
 	// Base greys
 	subtle  = lipgloss.Color("#626262")
@@ -19,6 +20,7 @@ var (
 	cyan      = lipgloss.Color("#00D7FF") // cyan — secondary accent
 	white     = lipgloss.Color("#FFFFFF")
 	cream     = lipgloss.Color("#EEEEEE") // softer than pure white
+	magenta   = lipgloss.Color("#FF6AD5") // hot pink — gradient midpoint
 
 	// Status colors
 	green  = lipgloss.Color("#73F59F")
@@ -28,11 +30,18 @@ var (
 	// Header / branding
 	headerPurple = lipgloss.Color("#9B72FF")
 	headerBg     = lipgloss.Color("#1A1A2E")
+
+	// Gradient palette for active borders, logo, and accent rendering.
+	// This purple → pink → cyan gradient is the signature Charm look.
+	gradientPurple = lipgloss.Color("#AD6FFF") // bright lavender
+	gradientPink   = lipgloss.Color("#FF6AD5") // hot pink
+	gradientCyan   = lipgloss.Color("#00D7FF") // electric cyan
+
+	// UI element accents
+	keyBadgeBg = lipgloss.Color("#3A3A5C") // dark indigo for key hint badges
 )
 
 // Unicode symbols — these small touches make a big visual difference.
-// Go source files are UTF-8 by default, so you can use Unicode literals
-// directly in your code. No encoding declarations needed (unlike Python 2).
 const (
 	symbolCursor   = "▸"
 	symbolSelected = "◆"
@@ -42,6 +51,21 @@ const (
 	symbolCross    = "✗"
 	symbolK8s      = "⎈"
 )
+
+// Resource type icons — unique geometric shapes that give each kind its own character.
+var resourceIcons = map[resourceType]string{
+	resourcePods:         "●", // dot — individual unit
+	resourceDeployments:  "▲", // triangle — deploy upward
+	resourceStatefulSets: "■", // square — solid, stateful
+	resourceDaemonSets:   "◉", // target — runs everywhere
+	resourceServices:     "○", // circle — network endpoint
+	resourceIngresses:    "▷", // play — routing inbound
+	resourceConfigMaps:   "≡", // triple bar — configuration
+	resourceSecrets:      "◇", // diamond outline — hidden value
+	resourceJobs:         "▶", // filled play — run once
+	resourceCronJobs:     "↻", // cycle — recurring
+	resourcePVCs:         "□", // open square — storage volume
+}
 
 // Header bar — shown at the top of the screen with cluster info.
 var (
@@ -59,6 +83,11 @@ var (
 	headerDimStyle = lipgloss.NewStyle().
 			Background(headerBg).
 			Foreground(subtle)
+
+	headerValStyle = lipgloss.NewStyle().
+			Background(headerBg).
+			Foreground(cream).
+			Bold(true)
 )
 
 // Panel styles
@@ -96,6 +125,17 @@ var (
 	helpStyle = lipgloss.NewStyle().
 			Foreground(subtle)
 
+	// Key badge — dark background pill for keyboard shortcut hints
+	keyBadgeStyle = lipgloss.NewStyle().
+			Foreground(white).
+			Background(keyBadgeBg).
+			Bold(true).
+			Padding(0, 1)
+
+	// Key description — text after the badge
+	keyDescStyle = lipgloss.NewStyle().
+			Foreground(subtle)
+
 	// Detail panel
 	detailKeyStyle = lipgloss.NewStyle().
 			Foreground(cyan).
@@ -122,15 +162,16 @@ var (
 	healthErrorStyle = lipgloss.NewStyle().
 				Foreground(red)
 
-	// Table header style
+	// Table header style — underlined for a clean separation from data rows
 	tableHeaderStyle = lipgloss.NewStyle().
 				Foreground(cyan).
-				Bold(true)
+				Bold(true).
+				Underline(true)
 
-	// Action menu styles
+	// Action menu styles — gradient border for the floating overlay
 	actionMenuStyle = lipgloss.NewStyle().
 			Border(lipgloss.RoundedBorder()).
-			BorderForeground(highlight).
+			BorderForegroundBlend(gradientPurple, gradientPink, gradientCyan).
 			Padding(1, 2).
 			Background(lipgloss.Color("#1A1A2E"))
 
@@ -154,27 +195,45 @@ var (
 			Foreground(subtle)
 )
 
+// gradientString renders each rune of s with a color from the gradient,
+// starting at the given offset position. This is used to paint border
+// characters with a flowing color transition.
+func gradientString(s string, gradient []color.Color, offset int) string {
+	var b strings.Builder
+	for i, r := range s {
+		idx := offset + i
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= len(gradient) {
+			idx = len(gradient) - 1
+		}
+		b.WriteString(lipgloss.NewStyle().Foreground(gradient[idx]).Render(string(r)))
+	}
+	return b.String()
+}
+
+// renderGradientSep renders a horizontal separator line with a gradient.
+func renderGradientSep(width int) string {
+	if width <= 0 {
+		return ""
+	}
+	gradient := lipgloss.Blend1D(width, gradientPurple, gradientPink, gradientCyan)
+	return gradientString(strings.Repeat("─", width), gradient, 0)
+}
+
+// keyHint renders a key badge with a description for the help bar.
+// The key gets a dark background pill, making it look like a physical key.
+func keyHint(key, desc string) string {
+	return keyBadgeStyle.Render(key) + " " + keyDescStyle.Render(desc)
+}
+
 // renderPanel draws a box with a title embedded in the top border and an
 // optional counter in the bottom-right border, like lazygit does.
 //
-// Example output:
-//
-//	╭─Namespaces──────────────╮
-//	│  default                │
-//	│  kube-system            │
-//	╰────────────────1 of 4──╯
-//
-// We draw the border manually because lipgloss's built-in Border() doesn't
-// support embedding text in the border line.
+// Active panels get gradient borders (purple → pink → cyan) that flow
+// across the box-drawing characters. Inactive panels use flat grey.
 func renderPanel(title, content string, width, height int, active bool, cursor, total int) string {
-	borderColor := dimGrey
-	titleColor := subtle
-	if active {
-		borderColor = highlight
-		titleColor = highlight
-	}
-
-	// Characters for rounded box-drawing
 	const (
 		topLeft     = "╭"
 		topRight    = "╮"
@@ -184,39 +243,43 @@ func renderPanel(title, content string, width, height int, active bool, cursor, 
 		vertical    = "│"
 	)
 
-	bc := lipgloss.NewStyle().Foreground(borderColor)
-	tc := lipgloss.NewStyle().Foreground(titleColor).Bold(true)
+	innerWidth := width - 2
 
-	innerWidth := width - 2 // subtract left + right border chars
-
-	// Top border: ╭─ Title ────────────╮
+	// Title styling — bright white for active (contrast against gradient), subtle for inactive
+	var tc lipgloss.Style
+	if active {
+		tc = lipgloss.NewStyle().Foreground(white).Bold(true)
+	} else {
+		tc = lipgloss.NewStyle().Foreground(subtle).Bold(true)
+	}
 	titleText := tc.Render(title)
-	titleLen := lipgloss.Width(titleText)
-	topPadding := innerWidth - titleLen - 3 // -1 leading ─, -2 for spaces around title
+	titleVisualWidth := lipgloss.Width(titleText)
+
+	// Counter text — cream for active, subtle for inactive
+	counter := "0 of 0"
+	if total > 0 {
+		counter = fmt.Sprintf("%d of %d", cursor+1, total)
+	}
+	var counterText string
+	if active {
+		counterText = lipgloss.NewStyle().Foreground(cream).Render(counter)
+	} else {
+		counterText = counterStyle.Render(counter)
+	}
+	counterVisualWidth := lipgloss.Width(counterText)
+
+	// Padding calculations
+	topPadding := innerWidth - titleVisualWidth - 3
 	if topPadding < 0 {
 		topPadding = 0
 	}
-	topBorder := bc.Render(topLeft+horizontal+" ") + titleText + bc.Render(" "+strings.Repeat(horizontal, topPadding)+topRight)
-
-	// Bottom border: ╰───────── 1 of 4 ─╯
-	counter := ""
-	if total > 0 {
-		counter = fmt.Sprintf("%d of %d", cursor+1, total)
-	} else {
-		counter = "0 of 0"
-	}
-	counterText := counterStyle.Render(counter)
-	counterLen := lipgloss.Width(counterText)
-	bottomPadding := innerWidth - counterLen - 3 // -1 trailing ─, -2 for spaces around counter
+	bottomPadding := innerWidth - counterVisualWidth - 3
 	if bottomPadding < 0 {
 		bottomPadding = 0
 	}
-	bottomBorder := bc.Render(bottomLeft+strings.Repeat(horizontal, bottomPadding)+" ") + counterText + bc.Render(" "+horizontal+bottomRight)
 
-	// Content lines — pad each to innerWidth and add border chars
+	// Content lines — pad or trim to fill the height
 	contentLines := strings.Split(content, "\n")
-
-	// Pad or trim to fill the height (subtract 2 for top/bottom borders)
 	contentHeight := height - 2
 	for len(contentLines) < contentHeight {
 		contentLines = append(contentLines, "")
@@ -225,14 +288,57 @@ func renderPanel(title, content string, width, height int, active bool, cursor, 
 		contentLines = contentLines[:contentHeight]
 	}
 
+	var topBorder, bottomBorder string
 	var body strings.Builder
-	for _, line := range contentLines {
-		lineWidth := lipgloss.Width(line)
-		pad := innerWidth - lineWidth - 2 // -2 for left/right padding
-		if pad < 0 {
-			pad = 0
+
+	if active {
+		// ─── GRADIENT BORDERS ───
+		// Generate a horizontal gradient across the full border width
+		// and a vertical gradient for the side bars.
+		totalW := innerWidth + 2
+		hGradient := lipgloss.Blend1D(max(1, totalW), gradientPurple, gradientPink, gradientCyan)
+		vGradient := lipgloss.Blend1D(max(1, contentHeight), gradientPurple, gradientCyan)
+
+		// Top border: ╭─ Title ────────────╮
+		topPrefix := topLeft + horizontal + " "
+		topSuffix := " " + strings.Repeat(horizontal, topPadding) + topRight
+		topBorder = gradientString(topPrefix, hGradient, 0) +
+			titleText +
+			gradientString(topSuffix, hGradient, 3+titleVisualWidth)
+
+		// Bottom border: ╰───────── 1 of 4 ─╯
+		botPrefix := bottomLeft + strings.Repeat(horizontal, bottomPadding) + " "
+		botSuffix := " " + horizontal + bottomRight
+		botSuffixOffset := len([]rune(botPrefix)) + counterVisualWidth
+		bottomBorder = gradientString(botPrefix, hGradient, 0) +
+			counterText +
+			gradientString(botSuffix, hGradient, botSuffixOffset)
+
+		// Content rows with gradient side borders
+		for row, line := range contentLines {
+			lineWidth := lipgloss.Width(line)
+			pad := innerWidth - lineWidth - 2
+			if pad < 0 {
+				pad = 0
+			}
+			sc := lipgloss.NewStyle().Foreground(vGradient[row])
+			body.WriteString(sc.Render(vertical) + " " + line + strings.Repeat(" ", pad) + " " + sc.Render(vertical) + "\n")
 		}
-		body.WriteString(bc.Render(vertical) + " " + line + strings.Repeat(" ", pad) + " " + bc.Render(vertical) + "\n")
+	} else {
+		// ─── FLAT BORDERS (inactive) ───
+		bc := lipgloss.NewStyle().Foreground(dimGrey)
+
+		topBorder = bc.Render(topLeft+horizontal+" ") + titleText + bc.Render(" "+strings.Repeat(horizontal, topPadding)+topRight)
+		bottomBorder = bc.Render(bottomLeft+strings.Repeat(horizontal, bottomPadding)+" ") + counterText + bc.Render(" "+horizontal+bottomRight)
+
+		for _, line := range contentLines {
+			lineWidth := lipgloss.Width(line)
+			pad := innerWidth - lineWidth - 2
+			if pad < 0 {
+				pad = 0
+			}
+			body.WriteString(bc.Render(vertical) + " " + line + strings.Repeat(" ", pad) + " " + bc.Render(vertical) + "\n")
+		}
 	}
 
 	return topBorder + "\n" + body.String() + bottomBorder

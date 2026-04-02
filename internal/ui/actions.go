@@ -137,20 +137,22 @@ func (am actionMenu) view() string {
 
 	var items []string
 	for i, a := range am.actions {
-		key := actionKeyStyle.Render(fmt.Sprintf("[%s]", a.key))
+		key := keyBadgeStyle.Render(a.key)
 		desc := actionDescStyle.Render(a.name)
 		line := fmt.Sprintf("  %s  %s %s", key, a.icon, desc)
 
 		if i == am.cursor {
 			line = selectedItemStyle.Render(
-				fmt.Sprintf("%s %s  %s %s", symbolCursor, actionKeyStyle.Render(fmt.Sprintf("[%s]", a.key)), a.icon, a.name),
+				fmt.Sprintf("%s ", symbolCursor),
+			) + keyBadgeStyle.Render(a.key) + selectedItemStyle.Render(
+				fmt.Sprintf("  %s %s", a.icon, a.name),
 			)
 		}
 
 		items = append(items, line)
 	}
 
-	hint := actionDimStyle.Render("\n  [esc] cancel")
+	hint := "\n  " + keyHint("esc", "cancel")
 	content := title + "\n" + strings.Join(items, "\n") + hint
 
 	return actionMenuStyle.Render(content)
@@ -249,7 +251,7 @@ func (sd scaleDialog) view() string {
 
 	inputLine := fmt.Sprintf("  New replicas: %s", sd.input.View())
 
-	hint := actionDimStyle.Render("\n  [enter] apply  [esc] cancel")
+	hint := "\n  " + keyHint("enter", "apply") + "  " + keyHint("esc", "cancel")
 
 	content := title + "\n" + current + "\n\n" + inputLine + hint
 

@@ -986,7 +986,7 @@ func (m Model) View() tea.View {
 
 	panels := lipgloss.JoinHorizontal(lipgloss.Top, sidebar, mainPanel)
 
-	// Bottom bar — contextual help that changes based on state
+	// Bottom bar — contextual help with styled key badges
 	var bottomBar string
 	if m.searching {
 		bottomBar = m.renderSearchBar()
@@ -995,14 +995,18 @@ func (m Model) View() tea.View {
 		if m.searchScope == searchGlobal {
 			scope = "global"
 		}
-		bottomBar = helpStyle.Render(fmt.Sprintf(
-			"filter (%s): \"%s\"  [/] edit  [esc] clear", scope, m.searchQuery,
-		))
+		bottomBar = helpStyle.Render(fmt.Sprintf("filter (%s): \"%s\"", scope, m.searchQuery)) +
+			"  " + keyHint("/", "edit") + "  " + keyHint("esc", "clear")
 	} else if m.statusMsg != "" {
-		bottomBar = helpStyle.Foreground(special).Render(m.statusMsg)
+		bottomBar = lipgloss.NewStyle().Foreground(special).Render(symbolCheck + " " + m.statusMsg)
 	} else {
-		helpText := "[tab] switch pane  [j/k] navigate  [enter] actions  [/] search  [q] quit"
-		bottomBar = helpStyle.Render(helpText)
+		bottomBar = strings.Join([]string{
+			keyHint("tab", "switch"),
+			keyHint("j/k", "navigate"),
+			keyHint("enter", "actions"),
+			keyHint("/", "search"),
+			keyHint("q", "quit"),
+		}, "  ")
 	}
 
 	// Compose the full screen: header + panels + help bar
@@ -1061,19 +1065,36 @@ func (m Model) renderHeader() string {
 
 	left := fmt.Sprintf("%s  %s  %s", logo, cluster, ctx)
 
-	// Right side: cluster stats
+	// Right side: styled cluster stats with color-coded percentages.
+	// Labels are dim, values are bright, percentages are colored by load.
 	s := m.clusterStats
-	stats := headerDimStyle.Render(fmt.Sprintf(
-		"nodes: %d  pods: %d", s.NodeCount, s.PodCount,
-	))
+	sep := headerDimStyle.Render(" · ")
+
+	statLabel := func(label string) string {
+		return headerDimStyle.Render(label + " ")
+	}
+	statVal := func(val string) string {
+		return headerValStyle.Render(val)
+	}
+	statPct := func(pct float64) string {
+		c := green
+		if pct > 80 {
+			c = red
+		} else if pct > 50 {
+			c = yellow
+		}
+		return lipgloss.NewStyle().Background(headerBg).Foreground(c).Bold(true).
+			Render(fmt.Sprintf("%.0f%%", pct))
+	}
+
+	stats := statLabel("nodes") + statVal(fmt.Sprintf("%d", s.NodeCount)) +
+		sep + statLabel("pods") + statVal(fmt.Sprintf("%d", s.PodCount))
 
 	if s.MetricsAvailable && s.CPUTotalMillis > 0 {
 		cpuPct := float64(s.CPUUsedMillis) / float64(s.CPUTotalMillis) * 100
 		memPct := float64(s.MemUsedBytes) / float64(s.MemTotalBytes) * 100
-		stats = headerDimStyle.Render(fmt.Sprintf(
-			"nodes: %d  pods: %d  cpu: %.0f%%  mem: %.0f%%",
-			s.NodeCount, s.PodCount, cpuPct, memPct,
-		))
+		stats += sep + statLabel("cpu") + statPct(cpuPct) +
+			sep + statLabel("mem") + statPct(memPct)
 	}
 
 	// Pad the gap between left and right to fill the full width.
@@ -1111,19 +1132,23 @@ func (m Model) renderNamespaceList() string {
 }
 
 // renderResourceList builds the content for the resource type box (no title — it goes in the border).
+// Each resource type gets a unique icon for visual identity.
 func (m Model) renderResourceList() string {
 	var items []string
 	for i, rt := range allResourceTypes {
 		isCursorHere := m.activePane == leftPane && m.leftSection == resourcesSection && m.resCursor == i
 		isSelected := rt == m.selectedRes
 
+		icon := resourceIcons[rt]
+		label := icon + " " + rt.String()
+
 		var line string
 		if isCursorHere {
-			line = selectedItemStyle.Render(symbolCursor + " " + rt.String())
+			line = selectedItemStyle.Render(symbolCursor + " " + label)
 		} else if isSelected {
-			line = itemStyle.Render(symbolSelected + " " + rt.String())
+			line = itemStyle.Render(symbolSelected + " " + label)
 		} else {
-			line = dimmedItemStyle.Render("  " + rt.String())
+			line = dimmedItemStyle.Render("  " + label)
 		}
 		items = append(items, line)
 	}
@@ -1205,8 +1230,8 @@ func (m Model) renderMainPanel(width, height int) string {
 
 	table := headerLine + "\n" + strings.Join(rows, "\n")
 
-	// Detail panel — pushed to the bottom of the panel.
-	detailSep := dimmedItemStyle.Render(strings.Repeat("─", width-4))
+	// Detail panel — pushed to the bottom with a gradient separator.
+	detailSep := renderGradientSep(width - 4)
 
 	selected := m.filteredItems[m.itemCursor]
 	details := selected.Details()
@@ -1239,6 +1264,8 @@ func (m Model) renderSearchBar() string {
 		scope = "global"
 	}
 	prompt := searchBarStyle.Render("/ " + m.searchQuery + cursor)
-	hint := dimmedItemStyle.Render(fmt.Sprintf("  [tab] toggle scope (%s)  [enter] keep filter  [esc] clear", scope))
+	hint := "  " + keyHint("tab", "scope ("+scope+")") +
+		"  " + keyHint("enter", "keep") +
+		"  " + keyHint("esc", "clear")
 	return prompt + hint
 }

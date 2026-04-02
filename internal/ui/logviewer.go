@@ -239,17 +239,23 @@ func (lv logViewer) view() string {
 		Height(panelContentHeight).
 		Render(lipgloss.JoinVertical(lipgloss.Left, title, content, scrollInfo))
 
-	// Bottom bar: save prompt, status message, or normal help
+	// Bottom bar: save prompt, status message, or key badge help
 	var bottomBar string
 	if lv.saving {
 		cursor := searchCursorStyle.Render("█")
 		prompt := searchBarStyle.Render("Save as: " + lv.filename + cursor)
-		hint := dimmedItemStyle.Render("  [enter] save  [esc] cancel  [ctrl+u] clear")
+		hint := "  " + keyHint("enter", "save") + "  " + keyHint("esc", "cancel") + "  " + keyHint("ctrl+u", "clear")
 		bottomBar = prompt + hint
 	} else if lv.statusMsg != "" {
-		bottomBar = helpStyle.Render(lv.statusMsg + "  [s] save again")
+		bottomBar = lipgloss.NewStyle().Foreground(special).Render(symbolCheck+" "+lv.statusMsg) +
+			"  " + keyHint("s", "save again")
 	} else {
-		bottomBar = helpStyle.Render("[j/k] scroll  [g/G] top/bottom  [s] save  [esc] back")
+		bottomBar = strings.Join([]string{
+			keyHint("j/k", "scroll"),
+			keyHint("g/G", "top/bottom"),
+			keyHint("s", "save"),
+			keyHint("esc", "back"),
+		}, "  ")
 	}
 
 	return panel + "\n" + bottomBar

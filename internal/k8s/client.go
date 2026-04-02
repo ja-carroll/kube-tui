@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -42,44 +44,119 @@ type Client struct {
 type ContextInfo struct {
 	Name    string
 	Cluster string
+	File    string // absolute path to the kubeconfig file this context came from
 }
 
-// ListContexts reads all available contexts from ~/.kube/config.
-func ListContexts() []ContextInfo {
+// discoverKubeconfigs finds all kubeconfig files by checking:
+//  1. The KUBECONFIG environment variable (colon-separated paths, the standard convention)
+//  2. The default ~/.kube/config
+//  3. Any .yaml, .yml, or .conf files in ~/.kube/
+//
+// This lets users drop additional kubeconfig files into ~/.kube/ and have them
+// automatically discovered — no need to manually edit KUBECONFIG.
+func discoverKubeconfigs() []string {
 	home := homedir.HomeDir()
 	if home == "" {
 		return nil
 	}
-	kubeconfig := filepath.Join(home, ".kube", "config")
 
-	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig}
-	configOverrides := &clientcmd.ConfigOverrides{}
-	kubeLoader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
+	kubeDir := filepath.Join(home, ".kube")
+	seen := make(map[string]bool)
+	var files []string
 
-	rawConfig, err := kubeLoader.RawConfig()
-	if err != nil {
-		return nil
+	add := func(path string) {
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return
+		}
+		if seen[abs] {
+			return
+		}
+		// Only add files that actually exist
+		if _, err := os.Stat(abs); err != nil {
+			return
+		}
+		seen[abs] = true
+		files = append(files, abs)
 	}
+
+	// 1. KUBECONFIG env var — filepath.SplitList handles the OS-specific
+	//    separator (colon on unix, semicolon on windows).
+	if env := os.Getenv("KUBECONFIG"); env != "" {
+		for _, p := range filepath.SplitList(env) {
+			add(p)
+		}
+	}
+
+	// 2. Default config file
+	add(filepath.Join(kubeDir, "config"))
+
+	// 3. Scan ~/.kube/ for additional kubeconfig files
+	entries, err := os.ReadDir(kubeDir)
+	if err == nil {
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			ext := filepath.Ext(name)
+			if ext == ".yaml" || ext == ".yml" || ext == ".conf" {
+				add(filepath.Join(kubeDir, name))
+			}
+		}
+	}
+
+	return files
+}
+
+// ListContexts discovers all kubeconfig files and returns every context
+// found across all of them. Each ContextInfo records which file it came
+// from so the UI can display the source and connect with the right file.
+func ListContexts() []ContextInfo {
+	files := discoverKubeconfigs()
 
 	var contexts []ContextInfo
-	for name, ctx := range rawConfig.Contexts {
-		contexts = append(contexts, ContextInfo{
-			Name:    name,
-			Cluster: ctx.Cluster,
-		})
+	seen := make(map[string]bool)
+
+	for _, file := range files {
+		loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: file}
+		kubeLoader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			loadingRules, &clientcmd.ConfigOverrides{},
+		)
+
+		rawConfig, err := kubeLoader.RawConfig()
+		if err != nil {
+			continue // skip files that aren't valid kubeconfigs
+		}
+
+		for name, ctx := range rawConfig.Contexts {
+			if seen[name] {
+				continue // first file wins for duplicate context names
+			}
+			seen[name] = true
+			contexts = append(contexts, ContextInfo{
+				Name:    name,
+				Cluster: ctx.Cluster,
+				File:    file,
+			})
+		}
 	}
+
+	// Sort by file then name so contexts from the same kubeconfig are grouped
+	sort.Slice(contexts, func(i, j int) bool {
+		if contexts[i].File != contexts[j].File {
+			return contexts[i].File < contexts[j].File
+		}
+		return contexts[i].Name < contexts[j].Name
+	})
+
 	return contexts
 }
 
-// NewClientForContext creates a connection using a specific kubeconfig context.
-func NewClientForContext(contextName string) (*Client, error) {
-	home := homedir.HomeDir()
-	if home == "" {
-		return nil, fmt.Errorf("could not find home directory")
-	}
-	kubeconfig := filepath.Join(home, ".kube", "config")
-
-	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfig}
+// NewClientForContext creates a connection using a specific kubeconfig context
+// from the given kubeconfig file.
+func NewClientForContext(contextName, kubeconfigPath string) (*Client, error) {
+	loadingRules := &clientcmd.ClientConfigLoadingRules{ExplicitPath: kubeconfigPath}
 	configOverrides := &clientcmd.ConfigOverrides{CurrentContext: contextName}
 	kubeLoader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides)
 
