@@ -65,6 +65,7 @@ var resourceIcons = map[resourceType]string{
 	resourceJobs:         "▶", // filled play — run once
 	resourceCronJobs:     "↻", // cycle — recurring
 	resourcePVCs:         "□", // open square — storage volume
+	resourceEvents:       "⚡", // lightning — events happening
 }
 
 // Header bar — shown at the top of the screen with cluster info.

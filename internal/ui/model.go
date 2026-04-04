@@ -86,6 +86,7 @@ const (
 	resourceJobs
 	resourceCronJobs
 	resourcePVCs
+	resourceEvents
 )
 
 func (rt resourceType) String() string {
@@ -112,6 +113,8 @@ func (rt resourceType) String() string {
 		return "CronJobs"
 	case resourcePVCs:
 		return "PVCs"
+	case resourceEvents:
+		return "Events"
 	default:
 		return "Unknown"
 	}
@@ -129,6 +132,7 @@ var allResourceTypes = []resourceType{
 	resourceJobs,
 	resourceCronJobs,
 	resourcePVCs,
+	resourceEvents,
 }
 
 // pane tracks which panel is focused.
@@ -180,6 +184,16 @@ type Model struct {
 	// Scale dialog state
 	showScale   bool
 	scaleDialog scaleDialog
+
+	// Namespace picker overlay — opened with `n` from anywhere.
+	showNSPicker bool
+	nsPicker     nsPicker
+
+	// Confirmation dialog — shown before destructive actions like delete.
+	// confirmCmd is the action to run if the user confirms.
+	showConfirm   bool
+	confirmDialog confirmDialog
+	confirmCmd    tea.Cmd
 
 	// YAML editor state — tracks the temp file and resource being edited
 	// so we can apply changes when the editor exits.
@@ -317,6 +331,8 @@ func (m Model) fetchResources() tea.Cmd {
 			items, err = client.ListCronJobResources(context.Background(), ns)
 		case resourcePVCs:
 			items, err = client.ListPVCResources(context.Background(), ns)
+		case resourceEvents:
+			items, err = client.ListEventResources(context.Background(), ns)
 		}
 
 		return resourceMsg{items: items, err: err}
@@ -356,6 +372,8 @@ func (m Model) refreshResources() tea.Cmd {
 			items, err = client.ListCronJobResources(context.Background(), ns)
 		case resourcePVCs:
 			items, err = client.ListPVCResources(context.Background(), ns)
+		case resourceEvents:
+			items, err = client.ListEventResources(context.Background(), ns)
 		}
 
 		return resourceMsg{items: items, err: err, isRefresh: true}
@@ -376,7 +394,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case logLineMsg:
-		m.logViewer.lines = append(m.logViewer.lines, msg.line)
+		m.logViewer = m.logViewer.appendLine(msg.line)
 		return m, waitForNextLogLine()
 
 	case logDoneMsg:
@@ -485,7 +503,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tickMsg:
 		// Don't refresh while overlays are open or logs are streaming —
 		// it would cause flicker or interfere with the user's interaction.
-		if m.viewingLogs || m.showActions || m.showScale {
+		if m.viewingLogs || m.showActions || m.showScale || m.showNSPicker || m.showConfirm {
 			return m, m.tickCmd()
 		}
 		return m, tea.Batch(m.refreshResources(), m.fetchClusterStats(), m.tickCmd())
@@ -508,6 +526,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.showScale {
 			return m.handleScaleDialog(msg)
+		}
+		if m.showNSPicker {
+			return m.handleNSPicker(msg)
+		}
+		if m.showConfirm {
+			return m.handleConfirm(msg)
 		}
 		return m.handleKeyPress(msg)
 	}
@@ -553,6 +577,15 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.searchQuery = ""
 			m.refilter()
 		}
+
+	case "n":
+		// Quick namespace switcher — works from anywhere so the user
+		// doesn't have to tab back to the namespaces panel.
+		if len(m.namespaces) > 0 {
+			m.nsPicker = newNSPicker(m.namespaces, m.selectedNS)
+			m.showNSPicker = true
+		}
+		return m, nil
 
 	case "/":
 		// Enter search mode. If a filter is already active, re-open
@@ -739,12 +772,32 @@ func (m Model) handleActionMenu(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		})
 
 	case "d":
-		// Delete resource
-		return m, m.deleteResource()
+		// Delete is destructive — require confirmation first.
+		resName := m.actionMenu.resource.Name()
+		resType := m.selectedRes.String()
+		m.confirmDialog = confirmDialog{
+			title:   "Delete " + resType,
+			message: fmt.Sprintf("Delete %s \"%s\" in namespace \"%s\"?\nThis cannot be undone.", resType, resName, m.selectedNS),
+			danger:  true,
+		}
+		m.confirmCmd = m.deleteResource()
+		m.showConfirm = true
+		return m, nil
 
 	case "r":
-		// Restart — for pods this deletes the pod (controller recreates it),
-		// for deployments/statefulsets/daemonsets it does a rollout restart.
+		// For pods, restart = delete (controller recreates) — also destructive.
+		// For workloads it's a rollout restart, which is gentler, so no confirm.
+		if m.selectedRes == resourcePods {
+			resName := m.actionMenu.resource.Name()
+			m.confirmDialog = confirmDialog{
+				title:   "Restart pod",
+				message: fmt.Sprintf("Delete pod \"%s\" so its controller recreates it?", resName),
+				danger:  true,
+			}
+			m.confirmCmd = m.restartResource()
+			m.showConfirm = true
+			return m, nil
+		}
 		return m, m.restartResource()
 
 	case "s":
@@ -794,6 +847,56 @@ func (m Model) handleScaleDialog(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		err := client.ScaleResource(context.Background(), resType, ns, resName, replicas)
 		return scaleDoneMsg{err: err}
 	}
+}
+
+// handleConfirm processes keypresses on the confirmation dialog. If the
+// user confirms, the stored tea.Cmd is executed; otherwise it's discarded.
+func (m Model) handleConfirm(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	cd, closed, confirmed := m.confirmDialog.update(msg)
+	m.confirmDialog = cd
+
+	if !closed {
+		return m, nil
+	}
+
+	m.showConfirm = false
+	cmd := m.confirmCmd
+	m.confirmCmd = nil
+
+	if !confirmed {
+		return m, nil
+	}
+	return m, cmd
+}
+
+// handleNSPicker delegates keypresses to the namespace picker overlay and,
+// if the user selects a new namespace, refetches resources for it.
+func (m Model) handleNSPicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	picker, closed, selected := m.nsPicker.update(msg)
+	m.nsPicker = picker
+
+	if !closed {
+		return m, nil
+	}
+
+	m.showNSPicker = false
+
+	// Cancelled or unchanged — no-op.
+	if selected == "" || selected == m.selectedNS {
+		return m, nil
+	}
+
+	// Also move the sidebar nsCursor so it stays in sync with the jump.
+	m.selectedNS = selected
+	for i, ns := range m.filteredNS {
+		if ns == selected {
+			m.nsCursor = i
+			break
+		}
+	}
+	m.items = nil
+	m.filteredItems = nil
+	return m, m.fetchResources()
 }
 
 // openYAMLEditor fetches the resource YAML, writes it to a temp file, and
@@ -1004,6 +1107,7 @@ func (m Model) View() tea.View {
 			keyHint("tab", "switch"),
 			keyHint("j/k", "navigate"),
 			keyHint("enter", "actions"),
+			keyHint("n", "namespace"),
 			keyHint("/", "search"),
 			keyHint("q", "quit"),
 		}, "  ")
@@ -1038,6 +1142,32 @@ func (m Model) View() tea.View {
 		bg := lipgloss.NewLayer(screen)
 		fg := lipgloss.NewLayer(menuBox).X(menuX).Y(menuY).Z(1)
 
+		return altView(lipgloss.NewCompositor(bg, fg).Render())
+	}
+
+	// Confirmation dialog overlay — highest priority, centered on screen
+	if m.showConfirm {
+		box := m.confirmDialog.view()
+		bw := lipgloss.Width(box)
+		bh := lipgloss.Height(box)
+		bx := (m.width - bw) / 2
+		by := (m.height - bh) / 2
+
+		bg := lipgloss.NewLayer(screen)
+		fg := lipgloss.NewLayer(box).X(bx).Y(by).Z(1)
+		return altView(lipgloss.NewCompositor(bg, fg).Render())
+	}
+
+	// Namespace picker overlay — same compositor pattern
+	if m.showNSPicker {
+		pickerBox := m.nsPicker.view()
+		pw := lipgloss.Width(pickerBox)
+		ph := lipgloss.Height(pickerBox)
+		px := (m.width - pw) / 2
+		py := (m.height - ph) / 2
+
+		bg := lipgloss.NewLayer(screen)
+		fg := lipgloss.NewLayer(pickerBox).X(px).Y(py).Z(1)
 		return altView(lipgloss.NewCompositor(bg, fg).Render())
 	}
 

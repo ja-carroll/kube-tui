@@ -534,6 +534,13 @@ func (c *Client) GetResourceYAML(ctx context.Context, resType, namespace, name s
 		} else {
 			raw, err = json.Marshal(obj)
 		}
+	case "Events":
+		obj, e := c.clientset.CoreV1().Events(namespace).Get(ctx, name, metav1.GetOptions{})
+		if e != nil {
+			err = e
+		} else {
+			raw, err = json.Marshal(obj)
+		}
 	default:
 		return "", fmt.Errorf("unsupported resource type: %s", resType)
 	}

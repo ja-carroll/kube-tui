@@ -67,6 +67,12 @@ func actionsForResource(res resourceType) []action {
 			{"l", "View logs", symbolArrow},
 		}, common...)
 
+	case resourceEvents:
+		// Events are informational — no deletion or edit actions.
+		return []action{
+			{"y", "View YAML", symbolArrow},
+		}
+
 	default:
 		return common
 	}

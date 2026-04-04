@@ -30,12 +30,16 @@ type logSavedMsg struct {
 	err  error
 }
 
+// maxLogLines caps the in-memory buffer so log streaming doesn't grow
+// unbounded. When we hit this, we drop the oldest lines.
+const maxLogLines = 5000
+
 // logViewer holds the state for the full-screen log overlay.
 type logViewer struct {
 	podName   string
 	namespace string
 	lines     []string
-	offset    int
+	offset    int // 0 = at bottom (following), N = N lines scrolled up
 	width     int
 	height    int
 	cancel    context.CancelFunc
@@ -44,19 +48,16 @@ type logViewer struct {
 	saving   bool   // true when the filename prompt is open
 	filename string // the filename being edited
 
+	// Filter state — hides non-matching lines from the view
+	filtering bool   // true when the filter prompt is open (typing)
+	filter    string // active filter query (may be non-empty when not typing)
+
 	// Status message shown briefly after save
 	statusMsg string
 }
 
 // defaultFilename generates a sensible default like "nginx-abc123-2026-03-29T20-15-30.log"
 func (lv logViewer) defaultFilename() string {
-	// time.Now().Format uses Go's unique approach to time formatting.
-	// Instead of strftime tokens like %Y-%m-%d, Go uses a "reference time":
-	// Mon Jan 2 15:04:05 MST 2006
-	// You rearrange that specific date/time to define your format.
-	// Why that date? Because it's 01/02 03:04:05 06 -07 — each component
-	// is a different number (1-7), making it unambiguous.
-	// It's weird but you get used to it!
 	ts := time.Now().Format("2006-01-02T15-04-05")
 	return fmt.Sprintf("%s-%s.log", lv.podName, ts)
 }
@@ -101,19 +102,88 @@ func waitForNextLogLine() tea.Cmd {
 	}
 }
 
+// appendLine adds a line to the buffer, caps the buffer size, and keeps
+// the scroll offset anchored so scrolled-up views don't drift when new
+// lines arrive. Returns the updated viewer.
+func (lv logViewer) appendLine(line string) logViewer {
+	lv.lines = append(lv.lines, line)
+
+	// Drop oldest lines if we exceed the cap.
+	if len(lv.lines) > maxLogLines {
+		drop := len(lv.lines) - maxLogLines
+		lv.lines = lv.lines[drop:]
+		// If the user is scrolled up, compensate so their viewport stays put.
+		if lv.offset > 0 {
+			lv.offset -= drop
+			if lv.offset < 0 {
+				lv.offset = 0
+			}
+		}
+	}
+
+	// If the user is scrolled up (not following), keep their viewport
+	// anchored by incrementing the offset. When offset == 0 they're at
+	// the bottom, so the new line just appears naturally.
+	if lv.offset > 0 {
+		lv.offset++
+		// Clamp — if filter is on, the visible count may cap this.
+		max := lv.maxScroll()
+		if lv.offset > max {
+			lv.offset = max
+		}
+	}
+
+	return lv
+}
+
+// visibleLines returns the lines to actually show, after applying the filter.
+// Building this once per render is cheap and keeps the rendering code clean.
+func (lv logViewer) visibleLines() []string {
+	if lv.filter == "" {
+		return lv.lines
+	}
+	q := strings.ToLower(lv.filter)
+	out := make([]string, 0, len(lv.lines))
+	for _, l := range lv.lines {
+		if strings.Contains(strings.ToLower(l), q) {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+// maxScroll returns the maximum valid offset given current buffer + filter.
+func (lv logViewer) maxScroll() int {
+	m := len(lv.visibleLines()) - lv.viewableHeight()
+	if m < 0 {
+		return 0
+	}
+	return m
+}
+
 func (lv logViewer) update(msg tea.KeyPressMsg) (logViewer, bool, tea.Cmd) {
-	// If we're in the save prompt, handle filename input
 	if lv.saving {
 		return lv.handleSaveInput(msg), false, nil
 	}
-
-	maxScroll := len(lv.lines) - lv.viewableHeight()
-	if maxScroll < 0 {
-		maxScroll = 0
+	if lv.filtering {
+		return lv.handleFilterInput(msg), false, nil
 	}
 
+	maxScroll := lv.maxScroll()
+
 	switch msg.String() {
-	case "esc", "q":
+	case "esc":
+		// esc clears an active filter first; if no filter, closes the viewer.
+		if lv.filter != "" {
+			lv.filter = ""
+			lv.offset = 0
+			return lv, false, nil
+		}
+		lv.cancel()
+		activeLogChan = nil
+		return lv, true, nil
+
+	case "q":
 		lv.cancel()
 		activeLogChan = nil
 		return lv, true, nil
@@ -128,16 +198,33 @@ func (lv logViewer) update(msg tea.KeyPressMsg) (logViewer, bool, tea.Cmd) {
 			lv.offset--
 		}
 
+	case "pgup", "ctrl+u":
+		lv.offset += lv.viewableHeight() / 2
+		if lv.offset > maxScroll {
+			lv.offset = maxScroll
+		}
+
+	case "pgdown", "ctrl+d":
+		lv.offset -= lv.viewableHeight() / 2
+		if lv.offset < 0 {
+			lv.offset = 0
+		}
+
 	case "g":
+		// Jump to top of buffer
 		lv.offset = maxScroll
 
 	case "G":
+		// Jump to bottom (resume following)
 		lv.offset = 0
 
 	case "s":
-		// Open the save prompt with the default filename pre-filled
 		lv.saving = true
 		lv.filename = lv.defaultFilename()
+		lv.statusMsg = ""
+
+	case "/":
+		lv.filtering = true
 		lv.statusMsg = ""
 	}
 
@@ -148,16 +235,13 @@ func (lv logViewer) update(msg tea.KeyPressMsg) (logViewer, bool, tea.Cmd) {
 func (lv logViewer) handleSaveInput(msg tea.KeyPressMsg) logViewer {
 	switch msg.String() {
 	case "esc":
-		// Cancel the save
 		lv.saving = false
 		lv.filename = ""
 
 	case "enter":
-		// Write the file. os.WriteFile is Go's one-liner for writing a file.
-		// It creates the file if it doesn't exist, truncates it if it does.
-		// 0644 is the Unix file permission: owner read/write, others read-only.
-		// In Go, file permissions use os.FileMode which is just a uint32.
 		lv.saving = false
+		// Save the full unfiltered buffer by default — the user probably
+		// wants the complete log file, not just what's on screen.
 		content := strings.Join(lv.lines, "\n") + "\n"
 		err := os.WriteFile(lv.filename, []byte(content), 0644)
 		if err != nil {
@@ -173,7 +257,6 @@ func (lv logViewer) handleSaveInput(msg tea.KeyPressMsg) logViewer {
 			lv.filename = string(runes[:len(runes)-1])
 		}
 
-	// ctrl+u clears the whole input — a common terminal shortcut
 	case "ctrl+u":
 		lv.filename = ""
 
@@ -189,24 +272,107 @@ func (lv logViewer) handleSaveInput(msg tea.KeyPressMsg) logViewer {
 	return lv
 }
 
+// handleFilterInput processes keystrokes in the filter prompt.
+func (lv logViewer) handleFilterInput(msg tea.KeyPressMsg) logViewer {
+	switch msg.String() {
+	case "esc":
+		// Cancel the filter entirely
+		lv.filtering = false
+		lv.filter = ""
+		lv.offset = 0
+
+	case "enter":
+		// Keep the filter active; close the prompt so keys navigate again.
+		lv.filtering = false
+		lv.offset = 0
+
+	case "backspace":
+		if len(lv.filter) > 0 {
+			runes := []rune(lv.filter)
+			lv.filter = string(runes[:len(runes)-1])
+			lv.offset = 0
+		}
+
+	case "ctrl+u":
+		lv.filter = ""
+		lv.offset = 0
+
+	case "ctrl+c":
+		lv.filtering = false
+
+	default:
+		if len(msg.String()) == 1 {
+			lv.filter += msg.String()
+			lv.offset = 0
+		}
+	}
+	return lv
+}
+
+// logPanelStyle is a dedicated panel style for the log viewer — no
+// padding, just a gradient border. Removing padding makes height math
+// exact, so the bottom border always lands where we expect it to.
+var logPanelStyle = lipgloss.NewStyle().
+	Border(lipgloss.RoundedBorder()).
+	BorderForegroundBlend(gradientPurple, gradientPink, gradientCyan)
+
 func (lv logViewer) viewableHeight() int {
-	// Total height budget: terminal height
-	// - 4 for box overhead (border + padding)
-	// - 2 for help bar
-	// - 3 for title + scroll info + gaps inside the box
-	h := lv.height - 9
+	// Height budget: terminal height
+	// - 2 for border (top + bottom)
+	// - 1 for title row (inside the box)
+	// - 1 for status bar at the bottom
+	h := lv.height - 4
 	if h < 1 {
 		h = 1
 	}
 	return h
 }
 
+// innerWidth returns the usable width inside the panel (after border).
+// We truncate log lines to this so they never wrap — wrapping would add
+// visual rows beyond our height budget and spill past the terminal.
+func (lv logViewer) innerWidth() int {
+	// logPanelStyle: border(1+1) = 2 chars of frame. We add a 1-char
+	// left gutter for visual breathing room, so subtract 3 total.
+	w := lv.width - 3
+	if w < 10 {
+		w = 10
+	}
+	return w
+}
+
+// addLeftGutter prefixes each line with a single space so log content has
+// a bit of breathing room from the panel border.
+func addLeftGutter(s string) string {
+	lines := strings.Split(s, "\n")
+	for i, l := range lines {
+		lines[i] = " " + l
+	}
+	return strings.Join(lines, "\n")
+}
+
+// truncate clips s to n runes, appending "…" if truncated. Works on runes
+// (not bytes) so multi-byte characters don't get cut mid-glyph.
+func truncate(s string, n int) string {
+	if n <= 1 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n-1]) + "…"
+}
+
 func (lv logViewer) view() string {
 	viewHeight := lv.viewableHeight()
+	innerW := lv.innerWidth()
 
-	title := titleStyle.Render(fmt.Sprintf("Logs: %s/%s", lv.namespace, lv.podName))
+	titleText := fmt.Sprintf("Logs: %s/%s", lv.namespace, lv.podName)
+	title := titleStyle.Render(truncate(titleText, innerW))
 
-	totalLines := len(lv.lines)
+	visible := lv.visibleLines()
+	totalLines := len(visible)
 	end := totalLines - lv.offset
 	start := end - viewHeight
 	if start < 0 {
@@ -216,46 +382,84 @@ func (lv logViewer) view() string {
 		end = 0
 	}
 
-	var visible []string
+	var window []string
 	if totalLines > 0 && start < totalLines {
-		visible = lv.lines[start:end]
+		window = visible[start:end]
 	}
 
-	content := strings.Join(visible, "\n")
-	lineCount := len(visible)
-	if lineCount < viewHeight {
-		content += strings.Repeat("\n", viewHeight-lineCount)
+	// Truncate every visible line to the inner width to prevent wrapping.
+	// This is what actually fixes the overflow bug.
+	truncated := make([]string, 0, len(window))
+	for _, line := range window {
+		truncated = append(truncated, truncate(line, innerW))
 	}
 
-	scrollInfo := dimmedItemStyle.Render(fmt.Sprintf(
-		"%d lines total | offset: %d",
-		totalLines, lv.offset,
-	))
+	// Pad out to the full height so the box renders at a stable size.
+	content := strings.Join(truncated, "\n")
+	if len(truncated) < viewHeight {
+		content += strings.Repeat("\n", viewHeight-len(truncated))
+	}
 
-	// Set explicit height to prevent overflow. Content height = terminal - overhead.
-	panelContentHeight := lv.height - 6 // 4 box overhead + 2 help bar
-	panel := activePanelStyle.
-		Width(lv.width - 4).
-		Height(panelContentHeight).
-		Render(lipgloss.JoinVertical(lipgloss.Left, title, content, scrollInfo))
+	// Render the panel with exact dimensions. Inner height must equal
+	// title(1) + content(viewHeight) = lv.height - 3, so outer = lv.height - 1.
+	panelInnerHeight := 1 + viewHeight // title + content rows
+	panel := logPanelStyle.
+		Width(lv.width - 2).
+		Height(panelInnerHeight).
+		MaxHeight(panelInnerHeight).
+		MaxWidth(lv.width - 2).
+		Render(lipgloss.JoinVertical(lipgloss.Left, " "+title, addLeftGutter(content)))
 
-	// Bottom bar: save prompt, status message, or key badge help
+	// Bottom bar: context-sensitive prompt, status message, or a status
+	// strip combining follow state + line counts + key hints.
 	var bottomBar string
-	if lv.saving {
+	switch {
+	case lv.saving:
 		cursor := searchCursorStyle.Render("█")
 		prompt := searchBarStyle.Render("Save as: " + lv.filename + cursor)
 		hint := "  " + keyHint("enter", "save") + "  " + keyHint("esc", "cancel") + "  " + keyHint("ctrl+u", "clear")
 		bottomBar = prompt + hint
-	} else if lv.statusMsg != "" {
+
+	case lv.filtering:
+		cursor := searchCursorStyle.Render("█")
+		prompt := searchBarStyle.Render("filter: " + lv.filter + cursor)
+		hint := "  " + keyHint("enter", "apply") + "  " + keyHint("esc", "clear") + "  " + keyHint("ctrl+u", "reset")
+		bottomBar = prompt + hint
+
+	case lv.statusMsg != "":
 		bottomBar = lipgloss.NewStyle().Foreground(special).Render(symbolCheck+" "+lv.statusMsg) +
 			"  " + keyHint("s", "save again")
-	} else {
-		bottomBar = strings.Join([]string{
+
+	default:
+		// Status strip: follow indicator + line counter on the left,
+		// key hints on the right — classic statusline layout.
+		var followIndicator string
+		if lv.offset == 0 {
+			followIndicator = lipgloss.NewStyle().Foreground(green).Bold(true).Render("● FOLLOWING")
+		} else {
+			followIndicator = lipgloss.NewStyle().Foreground(yellow).Bold(true).Render("■ PAUSED")
+		}
+
+		counter := fmt.Sprintf("%d lines", len(lv.lines))
+		if lv.filter != "" {
+			counter = fmt.Sprintf("%d / %d matching \"%s\"", totalLines, len(lv.lines), lv.filter)
+		}
+		left := followIndicator + "  " + dimmedItemStyle.Render(counter)
+
+		right := strings.Join([]string{
 			keyHint("j/k", "scroll"),
 			keyHint("g/G", "top/bottom"),
+			keyHint("/", "filter"),
 			keyHint("s", "save"),
 			keyHint("esc", "back"),
 		}, "  ")
+
+		// Pad the gap so hints sit flush right, like the main header bar.
+		gap := lv.width - lipgloss.Width(left) - lipgloss.Width(right)
+		if gap < 2 {
+			gap = 2
+		}
+		bottomBar = left + strings.Repeat(" ", gap) + right
 	}
 
 	return panel + "\n" + bottomBar

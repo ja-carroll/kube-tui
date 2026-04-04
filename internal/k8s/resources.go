@@ -3,6 +3,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -564,6 +565,67 @@ func (p PVCResource) Details() []DetailRow {
 	}
 }
 
+// --- Event ---
+
+type EventResource struct {
+	EventName  string
+	Namespace  string
+	Type       string // Normal or Warning
+	Reason     string
+	Object     string // e.g. "Pod/my-app-abc123"
+	Message    string
+	Count      int32
+	LastSeen   string
+	FirstSeen  string
+	Source     string
+}
+
+func (e EventResource) Name() string { return e.EventName }
+
+func (e EventResource) TableHeaders() []string {
+	return []string{"TYPE", "REASON", "OBJECT", "COUNT", "LAST SEEN", "MESSAGE"}
+}
+
+func (e EventResource) TableRow() []string {
+	// Truncate message for the table — the full message lives in Details.
+	msg := e.Message
+	if len(msg) > 60 {
+		msg = msg[:57] + "..."
+	}
+	return []string{
+		e.Type,
+		e.Reason,
+		e.Object,
+		fmt.Sprintf("%d", e.Count),
+		e.LastSeen,
+		msg,
+	}
+}
+
+func (e EventResource) Health() HealthStatus {
+	switch e.Type {
+	case "Warning":
+		return HealthWarning
+	case "Normal":
+		return HealthOK
+	default:
+		return HealthNeutral
+	}
+}
+
+func (e EventResource) Details() []DetailRow {
+	return []DetailRow{
+		{"Type", e.Type},
+		{"Reason", e.Reason},
+		{"Object", e.Object},
+		{"Source", e.Source},
+		{"Count", fmt.Sprintf("%d", e.Count)},
+		{"First Seen", e.FirstSeen},
+		{"Last Seen", e.LastSeen},
+		{"Message", e.Message},
+	}
+}
+
 // --- List methods ---
 
 func formatAge(created metav1.Time) string {
@@ -582,6 +644,76 @@ func formatMemory(bytes int64) string {
 	default:
 		return fmt.Sprintf("%dB", bytes)
 	}
+}
+
+func (c *Client) ListEventResources(ctx context.Context, namespace string) ([]Resource, error) {
+	evList, err := c.clientset.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("listing events in %s: %w", namespace, err)
+	}
+
+	// Sort most-recent-first. EventTime (newer API) or LastTimestamp —
+	// events use either depending on which controller emitted them.
+	eventTs := func(i int) time.Time {
+		e := evList.Items[i]
+		if !e.EventTime.IsZero() {
+			return e.EventTime.Time
+		}
+		if !e.LastTimestamp.IsZero() {
+			return e.LastTimestamp.Time
+		}
+		return e.CreationTimestamp.Time
+	}
+	sort.Slice(evList.Items, func(i, j int) bool {
+		return eventTs(i).After(eventTs(j))
+	})
+
+	resources := make([]Resource, 0, len(evList.Items))
+	for _, ev := range evList.Items {
+		obj := fmt.Sprintf("%s/%s", ev.InvolvedObject.Kind, ev.InvolvedObject.Name)
+
+		// Prefer LastTimestamp; fall back to EventTime for newer events
+		// that use the v1 Events API, then to CreationTimestamp.
+		var lastSeen, firstSeen string
+		switch {
+		case !ev.LastTimestamp.IsZero():
+			lastSeen = formatAge(ev.LastTimestamp)
+		case !ev.EventTime.IsZero():
+			lastSeen = time.Since(ev.EventTime.Time).Round(time.Second).String()
+		default:
+			lastSeen = formatAge(ev.CreationTimestamp)
+		}
+		if !ev.FirstTimestamp.IsZero() {
+			firstSeen = formatAge(ev.FirstTimestamp)
+		} else {
+			firstSeen = lastSeen
+		}
+
+		count := ev.Count
+		if count == 0 {
+			count = 1
+		}
+
+		source := ev.Source.Component
+		if source == "" && ev.ReportingController != "" {
+			source = ev.ReportingController
+		}
+
+		resources = append(resources, EventResource{
+			EventName: ev.Name,
+			Namespace: ev.Namespace,
+			Type:      ev.Type,
+			Reason:    ev.Reason,
+			Object:    obj,
+			Message:   ev.Message,
+			Count:     count,
+			LastSeen:  lastSeen,
+			FirstSeen: firstSeen,
+			Source:    source,
+		})
+	}
+
+	return resources, nil
 }
 
 func (c *Client) ListPodResources(ctx context.Context, namespace string) ([]Resource, error) {
