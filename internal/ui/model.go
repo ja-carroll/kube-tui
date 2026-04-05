@@ -65,6 +65,14 @@ type clusterStatsMsg struct {
 	stats k8s.ClusterStats
 }
 
+// ctxSwitchedMsg is sent after attempting to switch contexts. If err is
+// nil, client holds the new connection and we rebuild the model's state.
+type ctxSwitchedMsg struct {
+	client  *k8s.Client
+	ctxName string
+	err     error
+}
+
 // tickMsg triggers a periodic refresh of the resource list.
 // This is how you do "reactive" UIs in Bubble Tea — there's no
 // background watcher or event stream. Instead, you set a timer
@@ -194,6 +202,10 @@ type Model struct {
 	showConfirm   bool
 	confirmDialog confirmDialog
 	confirmCmd    tea.Cmd
+
+	// Context switcher overlay — opened with `C` from anywhere.
+	showCtxPicker bool
+	ctxPicker     ctxPicker
 
 	// YAML editor state — tracks the temp file and resource being edited
 	// so we can apply changes when the editor exits.
@@ -500,10 +512,30 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clusterStats = msg.stats
 		return m, nil
 
+	case ctxSwitchedMsg:
+		if msg.err != nil {
+			m.statusMsg = fmt.Sprintf("Context switch failed: %v", msg.err)
+			return m, nil
+		}
+		// Swap the client and reset all context-dependent state. The new
+		// cluster has its own namespaces, pods, everything — we throw
+		// out stale data and start fresh with the same model.
+		m.client = msg.client
+		m.namespaces = nil
+		m.items = nil
+		m.filteredNS = nil
+		m.filteredItems = nil
+		m.selectedNS = ""
+		m.nsCursor = 0
+		m.itemCursor = 0
+		m.clusterStats = k8s.ClusterStats{}
+		m.statusMsg = "Connected to " + msg.ctxName
+		return m, tea.Batch(m.fetchNamespaces(), m.fetchClusterStats())
+
 	case tickMsg:
 		// Don't refresh while overlays are open or logs are streaming —
 		// it would cause flicker or interfere with the user's interaction.
-		if m.viewingLogs || m.showActions || m.showScale || m.showNSPicker || m.showConfirm {
+		if m.viewingLogs || m.showActions || m.showScale || m.showNSPicker || m.showConfirm || m.showCtxPicker {
 			return m, m.tickCmd()
 		}
 		return m, tea.Batch(m.refreshResources(), m.fetchClusterStats(), m.tickCmd())
@@ -533,6 +565,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showConfirm {
 			return m.handleConfirm(msg)
 		}
+		if m.showCtxPicker {
+			return m.handleCtxPicker(msg)
+		}
 		return m.handleKeyPress(msg)
 	}
 
@@ -553,6 +588,7 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 
 	case "tab":
+		// Forward cycle: namespaces → resources → main → namespaces
 		if m.activePane == leftPane && m.leftSection == namespacesSection {
 			m.leftSection = resourcesSection
 		} else if m.activePane == leftPane && m.leftSection == resourcesSection {
@@ -560,6 +596,17 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.activePane = leftPane
 			m.leftSection = namespacesSection
+		}
+
+	case "shift+tab":
+		// Reverse cycle: namespaces → main → resources → namespaces
+		if m.activePane == rightPane {
+			m.activePane = leftPane
+			m.leftSection = resourcesSection
+		} else if m.activePane == leftPane && m.leftSection == resourcesSection {
+			m.leftSection = namespacesSection
+		} else {
+			m.activePane = rightPane
 		}
 
 	case "up", "k":
@@ -584,6 +631,16 @@ func (m Model) handleKeyPress(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if len(m.namespaces) > 0 {
 			m.nsPicker = newNSPicker(m.namespaces, m.selectedNS)
 			m.showNSPicker = true
+		}
+		return m, nil
+
+	case "C":
+		// Switch cluster context without leaving the app. Lists every
+		// context across every kubeconfig the user has.
+		contexts := k8s.ListContexts()
+		if len(contexts) > 0 {
+			m.ctxPicker = newCtxPicker(contexts, m.client.ContextName)
+			m.showCtxPicker = true
 		}
 		return m, nil
 
@@ -899,6 +956,38 @@ func (m Model) handleNSPicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, m.fetchResources()
 }
 
+// handleCtxPicker delegates keypresses to the context picker and, on
+// selection, kicks off an async connection to the new cluster.
+func (m Model) handleCtxPicker(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
+	picker, closed, selected := m.ctxPicker.update(msg)
+	m.ctxPicker = picker
+
+	if !closed {
+		return m, nil
+	}
+
+	m.showCtxPicker = false
+
+	// Cancelled or chose the context we're already on — no-op.
+	if selected.Name == "" {
+		return m, nil
+	}
+	if selected.Name == m.client.ContextName {
+		return m, nil
+	}
+
+	// Build the new client on a goroutine so the TUI stays responsive
+	// while kubeconfig loading / TLS handshake happens. The result comes
+	// back as a ctxSwitchedMsg that Update() handles above.
+	m.statusMsg = "Connecting to " + selected.Name + "..."
+	ctxName := selected.Name
+	file := selected.File
+	return m, func() tea.Msg {
+		client, err := k8s.NewClientForContext(ctxName, file)
+		return ctxSwitchedMsg{client: client, ctxName: ctxName, err: err}
+	}
+}
+
 // openYAMLEditor fetches the resource YAML, writes it to a temp file, and
 // opens the user's editor. When the editor exits, editorFinishedMsg is sent.
 func (m *Model) openYAMLEditor() tea.Cmd {
@@ -1108,6 +1197,7 @@ func (m Model) View() tea.View {
 			keyHint("j/k", "navigate"),
 			keyHint("enter", "actions"),
 			keyHint("n", "namespace"),
+			keyHint("C", "context"),
 			keyHint("/", "search"),
 			keyHint("q", "quit"),
 		}, "  ")
@@ -1148,6 +1238,19 @@ func (m Model) View() tea.View {
 	// Confirmation dialog overlay — highest priority, centered on screen
 	if m.showConfirm {
 		box := m.confirmDialog.view()
+		bw := lipgloss.Width(box)
+		bh := lipgloss.Height(box)
+		bx := (m.width - bw) / 2
+		by := (m.height - bh) / 2
+
+		bg := lipgloss.NewLayer(screen)
+		fg := lipgloss.NewLayer(box).X(bx).Y(by).Z(1)
+		return altView(lipgloss.NewCompositor(bg, fg).Render())
+	}
+
+	// Context switcher overlay — same compositor pattern
+	if m.showCtxPicker {
+		box := m.ctxPicker.view()
 		bw := lipgloss.Width(box)
 		bh := lipgloss.Height(box)
 		bx := (m.width - bw) / 2
